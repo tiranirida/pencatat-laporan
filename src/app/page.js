@@ -1535,7 +1535,7 @@ export default function Home() {
                       <label className="block text-sm font-medium">Satuan *
                         <select className="mt-1" value={it.unit}
                           onChange={(e) => setJobItems(jobItems.map((x, i) => i === idx ? { ...x, unit: e.target.value } : x))}>
-                          <option value="kubik">kubik</option><option value="strip">strip</option><option value="pcs">pcs</option><option value="paket">paket</option>
+                          <option value="kubik">kubik</option><option value="strip">strip</option><option value="pcs">pcs</option><option value="paket">paket</option><option value="tanki">tanki</option>
                         </select>
                       </label>
                       <label className="block text-sm font-medium">Harga satuan (Rp) *
@@ -1665,7 +1665,7 @@ export default function Home() {
                   </label>
                   <label className="block text-sm font-medium">Satuan
                     <select className="mt-1" value={priceForm.unit} onChange={(e) => setPriceForm({ ...priceForm, unit: e.target.value })}>
-                      <option value="kubik">kubik</option><option value="strip">strip</option><option value="pcs">pcs</option><option value="paket">paket</option>
+                      <option value="kubik">kubik</option><option value="strip">strip</option><option value="pcs">pcs</option><option value="paket">paket</option><option value="tanki">tanki</option>
                     </select>
                   </label>
                   <label className="block text-sm font-medium">Harga satuan (Rp)

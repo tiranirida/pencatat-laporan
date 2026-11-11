@@ -154,7 +154,7 @@ async function qRun(env, sql, ...params) {
   }
 }
 
-const ITEM_UNITS = ["kubik", "strip", "pcs", "paket", ""];
+const ITEM_UNITS = ["kubik", "strip", "pcs", "paket", "tanki", ""];
 
 function validateItems(body) {
   const raw = body?.items;
@@ -167,7 +167,7 @@ function validateItems(body) {
     const unit_price = Number(it?.unit_price);
     if (!service_type || service_type.length > 100) return { error: "Jenis jasa tiap baris wajib diisi." };
     if (!Number.isFinite(qty) || qty <= 0 || qty > 100000) return { error: "Kubikasi/jumlah tiap baris harus lebih dari 0." };
-    if (!ITEM_UNITS.includes(unit)) return { error: "Satuan tidak valid (kubik/strip/pcs/paket)." };
+    if (!ITEM_UNITS.includes(unit)) return { error: "Satuan tidak valid (kubik/strip/pcs/paket/tanki)." };
     if (!Number.isSafeInteger(unit_price) || unit_price < 0) return { error: "Harga satuan harus angka >= 0." };
     items.push({ service_type, qty, unit, unit_price, amount: Math.round(qty * unit_price) });
   }
@@ -502,7 +502,7 @@ export async function handleApi(request, env) {
       const unit = (body?.unit || "").trim();
       const unitPrice = Number(body?.unit_price);
       if (!serviceType || serviceType.length > 100) return json({ error: "Nama jasa wajib diisi." }, 400);
-      if (!ITEM_UNITS.includes(unit)) return json({ error: "Satuan tidak valid (kubik/strip/pcs/paket)." }, 400);
+      if (!ITEM_UNITS.includes(unit)) return json({ error: "Satuan tidak valid (kubik/strip/pcs/paket/tanki)." }, 400);
       if (!Number.isSafeInteger(unitPrice) || unitPrice < 0) return json({ error: "Harga satuan harus angka >= 0." }, 400);
       const now = new Date().toISOString();
       const existing = await qFirst(env, "SELECT * FROM service_prices WHERE LOWER(service_type) = LOWER(?)", serviceType);
@@ -523,7 +523,7 @@ export async function handleApi(request, env) {
         const unit = (body?.unit || "").trim();
         const unitPrice = Number(body?.unit_price);
         if (!serviceType || serviceType.length > 100) return json({ error: "Nama jasa wajib diisi." }, 400);
-        if (!ITEM_UNITS.includes(unit)) return json({ error: "Satuan tidak valid (kubik/strip/pcs/paket)." }, 400);
+        if (!ITEM_UNITS.includes(unit)) return json({ error: "Satuan tidak valid (kubik/strip/pcs/paket/tanki)." }, 400);
         if (!Number.isSafeInteger(unitPrice) || unitPrice < 0) return json({ error: "Harga satuan harus angka >= 0." }, 400);
         const clash = await qFirst(env, "SELECT * FROM service_prices WHERE LOWER(service_type) = LOWER(?) AND id != ?", serviceType, id);
         if (clash) return json({ error: "Nama jasa sudah ada di daftar harga." }, 400);
