@@ -5,14 +5,14 @@
 #
 # [[d1_databases]]
 # binding = "DB"
-# database_name = "pencatat-laporan"
+# database_name = "laporan-androwee"
 # database_id = "ISI_ID_D1_DARI_DASHBOARD"
-name = "pencatat-laporan"
+name = "laporan-androwee"
 pages_build_output_dir = "out"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
 [[d1_databases]]
 binding = "DB"
-database_name = "pencatat-laporan"
-database_id = "054beb9f-91c6-4c7d-9ca2-df7510d6d19a"
+database_name = "laporan-androwee"
+database_id = "c5f6167d-9261-4a05-b6cd-c734110aedcb"
