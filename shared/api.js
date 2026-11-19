@@ -1,19 +1,25 @@
 // Core API untuk Pencatat Pelanggan Jasa.
 // Dijalankan di Cloudflare Pages Functions (runtime Workers).
-// Satu-satunya sumber login adalah environment variable Cloudflare,
-// TIDAK ada tabel user di D1 dan TIDAK ada kredensial di repo ini.
 //
-// Env yang wajib di-set di Dashboard Pages (Settings > Functions):
-//   ADMIN_USERNAME       (Variable, contoh: andro)
-//   ADMIN_PASSWORD_HASH  (Secret, SHA-256 hex dari password, lihat README)
-//   SESSION_SECRET       (Secret, string acak, contoh hasil `openssl rand -hex 32`)
-// Opsional (fallback, kurang disarankan dibanding hash):
-//   ADMIN_PASSWORD       (Secret, password mentah — hanya dipakai bila
-//                          ADMIN_PASSWORD_HASH tidak di-set)
+// Login ada dua macam:
+//   1. Password lama (satu akun admin): env ADMIN_USERNAME,
+//      ADMIN_PASSWORD_HASH (SHA-256 hex), SESSION_SECRET. Sesi ini
+//      mengakses usaha legacy (data yang sudah ada sebelum multi-tenant).
+//   2. Google OAuth (pendaftaran TERBUKA, siapa pun dengan akun Google
+//      bisa daftar): env GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET.
+//      Setiap pemilik usaha login sendiri dan hanya melihat usahanya.
+//      Sesi Google memakai cookie yang sama dengan sesi password.
+//
+// Multi-tenant: tabel businesses + kolom business_id di customers, jobs,
+// service_prices. Semua endpoint data WAJIB memfilter business_id dan
+// memverifikasi kepemilikan usaha. Data lama dimigrasikan sekali ke satu
+// usaha legacy (dari tabel settings). Sesi password bisa menghubungkan
+// akun Google-nya ke usaha legacy lewat /api/auth/google?mode=link.
 
 const SESSION_COOKIE = "session";
 const SESSION_MAX_AGE = 7 * 24 * 60 * 60; // 7 hari, dalam detik
 const STATUSES = ["lunas", "dp", "belum"];
+const MAX_BUSINESSES_PER_USER = 5;
 
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
@@ -61,30 +67,196 @@ function parseCookies(request) {
   return out;
 }
 
-async function makeSessionToken(env, username) {
+async function makeSessionToken(env, subject) {
+  // subject: username lama (mis. "andro") atau "g.<userId>" untuk Google.
+  // Format token lama (3 bagian) tetap didukung verifySession di bawah,
+  // jadi cookie password yang sudah ada tidak langsung mati.
   const exp = Math.floor(Date.now() / 1000) + SESSION_MAX_AGE;
-  const payload = `${encodeURIComponent(username)}.${exp}`;
+  const payload = `${encodeURIComponent(subject)}.${exp}`;
   const sig = await hmacHex(env.SESSION_SECRET, payload);
   return `${payload}.${sig}`;
 }
 
+// Identitas dari cookie sesi, atau null bila tidak login.
+// Password: { kind: "password", username }
+// Google:   { kind: "google", userId, email }
 async function verifySession(request, env) {
   if (!env.SESSION_SECRET) return null;
   const token = parseCookies(request)[SESSION_COOKIE];
   if (!token) return null;
   const parts = token.split(".");
-  if (parts.length !== 3) return null;
-  const [encodedUser, expStr, sig] = parts;
-  const exp = Number(expStr);
+  const exp = Number(parts[parts.length - 2]);
   if (!Number.isFinite(exp) || exp < Math.floor(Date.now() / 1000)) return null;
-  const payload = `${encodedUser}.${expStr}`;
+  const payload = parts.slice(0, -1).join(".");
   const expected = await hmacHex(env.SESSION_SECRET, payload);
-  if (!safeEqual(sig, expected)) return null;
-  return decodeURIComponent(encodedUser);
+  if (!safeEqual(parts[parts.length - 1], expected)) return null;
+  if (parts.length === 4 && parts[0] === "g") {
+    const userId = Number(parts[1]);
+    if (!Number.isSafeInteger(userId) || userId <= 0) return null;
+    const user = await qFirst(env, "SELECT id, email, name FROM users WHERE id = ?", userId).catch(() => null);
+    if (!user) return null;
+    return { kind: "google", userId: user.id, email: user.email, name: user.name };
+  }
+  if (parts.length === 3) {
+    return { kind: "password", username: decodeURIComponent(parts[0]) };
+  }
+  return null;
 }
 
 function sessionCookie(token, maxAge) {
   return `${SESSION_COOKIE}=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${maxAge}`;
+}
+
+// ---- Multi-tenant: users, businesses, business_id ----
+
+// Hasil ensure hanya perlu dihitung sekali per isolate Worker: isolate
+// dipakai ulang antar request, jadi request hangat tidak perlu mengulang
+// CREATE/ALTER/SELECT migrasi (~9 round trip D1) di tiap panggilan API.
+// Bila ensure gagal di tengah jalan, flag tidak diset sehingga request
+// berikutnya mencoba lagi.
+let ensuredMultiTenant = false;
+let ensuredNextVisit = false;
+let ensuredPaidAmount = false;
+let ensuredJobItems = false;
+
+async function ensureMultiTenant(env) {
+  if (ensuredMultiTenant) return;
+  // Pernyataan DDL-nya saling bebas (tabel & indeks berbeda) jadi
+  // dijalankan paralel, bukan satu-satu: ~9 round trip D1 berurutan
+  // menjadi 1 batch paralel. ALTER yang gagal (kolom sudah ada) ditelan
+  // per pernyataan supaya tidak menggagalkan yang lain.
+  await Promise.all([
+    qRun(env, "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, google_sub TEXT UNIQUE, email TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', picture TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL)"),
+    qRun(env, "CREATE TABLE IF NOT EXISTS businesses (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_user_id INTEGER, legacy INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL, address TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', website TEXT NOT NULL DEFAULT '', logo TEXT NOT NULL DEFAULT '', bank_name TEXT NOT NULL DEFAULT '', bank_account_number TEXT NOT NULL DEFAULT '', bank_account_holder TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"),
+    ...["customers", "jobs", "service_prices"].map((table) =>
+      qRun(env, `ALTER TABLE ${table} ADD COLUMN business_id INTEGER NOT NULL DEFAULT 0`).catch(() => {})),
+    ...[["customers", "idx_customers_business"], ["jobs", "idx_jobs_business"], ["service_prices", "idx_prices_business"]].map(([table, index]) =>
+      qRun(env, `CREATE INDEX IF NOT EXISTS ${index} ON ${table}(business_id)`)),
+  ]);
+  // Migrasi sekali: data lama (business_id 0) dipindah ke satu usaha
+  // legacy yang profilnya diambil dari tabel settings.
+  const existing = await qFirst(env, "SELECT id FROM businesses LIMIT 1");
+  if (!existing) {
+    const rows = await qAll(env, "SELECT key, value FROM settings").catch(() => []);
+    const s = {};
+    rows.forEach((r) => { s[r.key] = r.value; });
+    const hasData = s.business_name || (await qFirst(env, "SELECT id FROM customers LIMIT 1").catch(() => null)) || (await qFirst(env, "SELECT id FROM jobs LIMIT 1").catch(() => null));
+    if (hasData) {
+      const now = new Date().toISOString();
+      const res = await qRun(env,
+        "INSERT INTO businesses (owner_user_id, legacy, name, address, phone, website, logo, bank_name, bank_account_number, bank_account_holder, created_at, updated_at) VALUES (NULL, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        s.business_name || "Usaha Saya", s.business_address || "", s.business_phone || "", s.business_website || "",
+        s.business_logo || "", s.bank_name || "", s.bank_account_number || "", s.bank_account_holder || "", now, now);
+      const bid = res.meta.last_row_id;
+      for (const table of ["customers", "jobs", "service_prices"]) {
+        await qRun(env, `UPDATE ${table} SET business_id = ? WHERE business_id = 0`, bid);
+      }
+    }
+  }
+  ensuredMultiTenant = true;
+}
+
+// Usaha-usaha yang boleh diakses identitas ini.
+async function listBusinessesFor(env, identity) {
+  if (identity.kind === "google") {
+    return qAll(env, "SELECT * FROM businesses WHERE owner_user_id = ? ORDER BY id ASC", identity.userId);
+  }
+  return qAll(env, "SELECT * FROM businesses WHERE legacy = 1 ORDER BY id ASC");
+}
+
+// Tentukan usaha aktif untuk endpoint data. business_id diambil dari
+// query (?business_id=) atau header x-business-id. Bila tidak disebut
+// dan identitas hanya punya satu usaha, usaha itu yang dipakai.
+// Mengembalikan { business } atau { error, status }.
+async function resolveBusiness(request, env, identity) {
+  const url = new URL(request.url);
+  const raw = url.searchParams.get("business_id") || request.headers.get("x-business-id") || "";
+  const owned = await listBusinessesFor(env, identity);
+  if (!owned.length) return { error: "Belum ada usaha. Buat profil usaha dulu.", status: 400, code: "no_business" };
+  if (!raw) {
+    if (owned.length === 1) return { business: owned[0] };
+    return { error: "Pilih usaha dulu.", status: 400, code: "need_business" };
+  }
+  const id = Number(raw);
+  const business = owned.find((b) => b.id === id);
+  if (!business) return { error: "Usaha tidak ditemukan atau bukan milik Anda.", status: 403 };
+  return { business };
+}
+
+// Profil usaha dalam bentuk yang sama seperti /api/settings dulu
+// (business_name, dst.), supaya form Pengaturan & invoice tidak berubah.
+function businessSettings(b) {
+  return {
+    business_name: b.name || "",
+    business_address: b.address || "",
+    business_phone: b.phone || "",
+    business_website: b.website || "",
+    business_logo: b.logo || "",
+    bank_name: b.bank_name || "",
+    bank_account_number: b.bank_account_number || "",
+    bank_account_holder: b.bank_account_holder || "",
+  };
+}
+
+const BUSINESS_FIELDS = ["business_name", "business_address", "business_phone", "business_website", "business_logo", "bank_name", "bank_account_number", "bank_account_holder"];
+const BUSINESS_COLUMNS = { business_name: "name", business_address: "address", business_phone: "phone", business_website: "website", business_logo: "logo", bank_name: "bank_name", bank_account_number: "bank_account_number", bank_account_holder: "bank_account_holder" };
+
+function validateBusinessProfile(body) {
+  const out = {};
+  for (const key of BUSINESS_FIELDS) {
+    if (!(key in (body || {}))) continue;
+    const value = String(body[key] || "").trim();
+    if (key === "business_logo") {
+      if (value && !/^data:image\/(png|jpeg);base64,/.test(value)) return { error: "Logo harus berupa gambar PNG atau JPEG." };
+      if (value.length > 1500000) return { error: "Logo terlalu besar (maksimal sekitar 1 MB setelah diperkecil)." };
+    } else if (value.length > 200) {
+      return { error: `Isi ${key} maksimal 200 karakter.` };
+    }
+    out[key] = value;
+  }
+  return { values: out };
+}
+
+// ---- Google OAuth (authorization code flow, tanpa library) ----
+
+function b64urlEncode(bytes) {
+  const bin = typeof bytes === "string" ? bytes : String.fromCharCode(...new Uint8Array(bytes));
+  return btoa(bin).replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
+
+function b64urlDecode(str) {
+  const bin = atob(str.replaceAll("-", "+").replaceAll("_", "/"));
+  return [...bin].map((c) => c.charCodeAt(0));
+}
+
+async function signState(env, payload) {
+  const body = b64urlEncode(JSON.stringify(payload));
+  const sig = await hmacHex(env.SESSION_SECRET, body);
+  return `${body}.${sig}`;
+}
+
+async function verifyState(env, token) {
+  try {
+    const [body, sig] = String(token || "").split(".");
+    if (!body || !sig) return null;
+    if (!safeEqual(sig, await hmacHex(env.SESSION_SECRET, body))) return null;
+    const payload = JSON.parse(new TextDecoder().decode(new Uint8Array(b64urlDecode(body))));
+    if (!payload || !payload.exp || payload.exp < Math.floor(Date.now() / 1000)) return null;
+    if (payload.mode !== "login" && payload.mode !== "link") return null;
+    return payload;
+  } catch { return null; }
+}
+
+function googleRedirectUri(request) {
+  return `${new URL(request.url).origin}/api/auth/google/callback`;
+}
+
+function oauthErrorRedirect(message) {
+  return new Response(null, { status: 302, headers: { Location: `/?auth_error=${encodeURIComponent(message)}` } });
+}
+
+function stateCookie(token) {
+  return `oauth_state=${encodeURIComponent(token)}; HttpOnly; Secure; SameSite=Lax; Path=/api/auth/google; Max-Age=600`;
 }
 
 async function readJson(request) {
@@ -179,8 +351,10 @@ function itemsSummary(items) {
 }
 
 async function ensureJobItemsTable(env) {
+  if (ensuredJobItems) return;
   await qRun(env, "CREATE TABLE IF NOT EXISTS job_items (id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER NOT NULL REFERENCES jobs(id), service_type TEXT NOT NULL, qty REAL NOT NULL DEFAULT 1, unit TEXT NOT NULL DEFAULT '', unit_price INTEGER NOT NULL DEFAULT 0, amount INTEGER NOT NULL DEFAULT 0)");
   await qRun(env, "CREATE INDEX IF NOT EXISTS idx_job_items_job ON job_items(job_id)");
+  ensuredJobItems = true;
 }
 
 // Kolom paid_amount (sudah dibayar) ditambahkan ke jobs yang sudah ada
@@ -188,14 +362,18 @@ async function ensureJobItemsTable(env) {
 // dianggap sudah dibayar penuh, karena status adalah satu-satunya bukti
 // pembayaran yang tercatat untuk data lama tersebut.
 async function ensurePaidAmountColumn(env) {
+  if (ensuredPaidAmount) return;
   try { await qRun(env, "ALTER TABLE jobs ADD COLUMN paid_amount INTEGER NOT NULL DEFAULT 0"); } catch {}
   try { await qRun(env, "UPDATE jobs SET paid_amount = amount WHERE status = 'lunas' AND (paid_amount IS NULL OR paid_amount = 0)"); } catch {}
+  ensuredPaidAmount = true;
 }
 
 // Jadwal kunjungan berikutnya per pelanggan (kolom di customers, NULL =
 // tidak ada jadwal). Migrasi idempotent seperti paid_amount.
 async function ensureNextVisitColumn(env) {
+  if (ensuredNextVisit) return;
   try { await qRun(env, "ALTER TABLE customers ADD COLUMN next_visit_date TEXT"); } catch {}
+  ensuredNextVisit = true;
 }
 
 function validatePaidAmount(paidRaw, amount) {
@@ -239,7 +417,77 @@ export async function handleApi(request, env) {
     const path = url.pathname.replace(/\/$/, "") || "/";
     const method = request.method.toUpperCase();
 
-    // ---- Login: satu-satunya endpoint publik ----
+    // Tabel users/businesses + kolom business_id + migrasi data lama.
+    await ensureMultiTenant(env);
+
+    // ---- Google OAuth: endpoint publik ----
+    if (path === "/api/auth/google" && method === "GET") {
+      if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET || !env.SESSION_SECRET) {
+        return oauthErrorRedirect("Login Google belum dikonfigurasi. Set GOOGLE_CLIENT_ID dan GOOGLE_CLIENT_SECRET di Cloudflare.");
+      }
+      const mode = url.searchParams.get("mode") === "link" ? "link" : "login";
+      const state = await signState(env, { mode, exp: Math.floor(Date.now() / 1000) + 600, nonce: crypto.randomUUID() });
+      const authUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+      authUrl.searchParams.set("client_id", env.GOOGLE_CLIENT_ID);
+      authUrl.searchParams.set("redirect_uri", googleRedirectUri(request));
+      authUrl.searchParams.set("response_type", "code");
+      authUrl.searchParams.set("scope", "openid email profile");
+      authUrl.searchParams.set("state", state);
+      authUrl.searchParams.set("prompt", "select_account");
+      return new Response(null, { status: 302, headers: { Location: authUrl.toString(), "Set-Cookie": stateCookie(state) } });
+    }
+
+    if (path === "/api/auth/google/callback" && method === "GET") {
+      const code = url.searchParams.get("code") || "";
+      const state = url.searchParams.get("state") || "";
+      const stateCookieValue = parseCookies(request).oauth_state || "";
+      const payload = await verifyState(env, state);
+      if (!code || !payload || stateCookieValue !== state) {
+        return oauthErrorRedirect("Login Google gagal: sesi tidak valid. Coba lagi.");
+      }
+      if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
+        return oauthErrorRedirect("Login Google belum dikonfigurasi.");
+      }
+      try {
+        const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({
+            code, client_id: env.GOOGLE_CLIENT_ID, client_secret: env.GOOGLE_CLIENT_SECRET,
+            redirect_uri: googleRedirectUri(request), grant_type: "authorization_code",
+          }),
+        });
+        const tokenData = await tokenRes.json().catch(() => ({}));
+        if (!tokenRes.ok || !tokenData.id_token) {
+          return oauthErrorRedirect("Login Google gagal: Google menolak kode login. Coba lagi.");
+        }
+        const infoRes = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(tokenData.id_token)}`);
+        const info = await infoRes.json().catch(() => ({}));
+        if (!infoRes.ok || info.aud !== env.GOOGLE_CLIENT_ID || !info.email || info.email_verified !== "true" || !info.sub) {
+          return oauthErrorRedirect("Login Google gagal: identitas tidak terverifikasi.");
+        }
+        const now = new Date().toISOString();
+        await qRun(env,
+          "INSERT INTO users (google_sub, email, name, picture, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(google_sub) DO UPDATE SET email = excluded.email, name = excluded.name, picture = excluded.picture",
+          info.sub, info.email, info.name || "", info.picture || "", now);
+        const user = await qFirst(env, "SELECT id, email, name FROM users WHERE google_sub = ?", info.sub);
+        if (!user) return oauthErrorRedirect("Login Google gagal: akun tidak tersimpan. Coba lagi.");
+        if (payload.mode === "link") {
+          // Hubungkan usaha legacy ke akun Google ini; butuh sesi password.
+          const passwordIdentity = await verifySession(request, env);
+          if (!passwordIdentity || passwordIdentity.kind !== "password") {
+            return oauthErrorRedirect("Untuk menghubungkan akun Google, login dulu dengan password lama.");
+          }
+          await qRun(env, "UPDATE businesses SET owner_user_id = ? WHERE legacy = 1 AND (owner_user_id IS NULL OR owner_user_id = ?)", user.id, user.id);
+        }
+        const token = await makeSessionToken(env, `g.${user.id}`);
+        return new Response(null, { status: 302, headers: { Location: "/", "Set-Cookie": sessionCookie(token, SESSION_MAX_AGE) } });
+      } catch {
+        return oauthErrorRedirect("Login Google gagal: tidak bisa menghubungi Google. Coba lagi.");
+      }
+    }
+
+    // ---- Login password lama: satu-satunya endpoint publik lain ----
     if (path === "/api/login" && method === "POST") {
       if (!env.ADMIN_USERNAME || !env.SESSION_SECRET || (!env.ADMIN_PASSWORD_HASH && !env.ADMIN_PASSWORD)) {
         return json({ error: "Login belum dikonfigurasi. Set ADMIN_USERNAME, ADMIN_PASSWORD_HASH, dan SESSION_SECRET di Cloudflare (lihat README)." }, 503);
@@ -267,42 +515,176 @@ export async function handleApi(request, env) {
     }
 
     // ---- Semua endpoint lain wajib login ----
-    const username = await verifySession(request, env);
-    if (!username) return json({ error: "Belum login." }, 401);
+    const identity = await verifySession(request, env);
+    if (!identity) return json({ error: "Belum login." }, 401);
 
     if (path === "/api/me" && method === "GET") {
-      return json({ username });
+      const businesses = await listBusinessesFor(env, identity);
+      return json({
+        username: identity.kind === "google" ? identity.email : identity.username,
+        auth: identity.kind,
+        email: identity.kind === "google" ? identity.email : "",
+        name: identity.kind === "google" ? (identity.name || "") : "",
+        businesses: businesses.map((b) => ({ id: b.id, name: b.name })),
+      });
     }
 
-    // ---- Pengaturan usaha (key-value di D1, bukan env) ----
+    // ---- Bootstrap: semua yang dibutuhkan tampilan pertama dalam SATU
+    // panggilan (profil + pelanggan + transaksi + harga + total harian &
+    // bulanan). Sebelumnya halaman awal menembak 8 endpoint terpisah
+    // (/api/me dulu, lalu 2x reports + customers + jobs + settings +
+    // service-prices), masing-masing membayar biaya ensure migrasi dan
+    // round trip D1 sendiri — itu yang membuat laporan baru muncul
+    // setelah beberapa detik. Query di sini jalan paralel (Promise.all).
+    if (path === "/api/bootstrap" && method === "GET") {
+      const businesses = await listBusinessesFor(env, identity);
+      const base = {
+        username: identity.kind === "google" ? identity.email : identity.username,
+        auth: identity.kind,
+        email: identity.kind === "google" ? identity.email : "",
+        name: identity.kind === "google" ? (identity.name || "") : "",
+        businesses: businesses.map((b) => ({ id: b.id, name: b.name })),
+      };
+      const rawBid = url.searchParams.get("business_id") || request.headers.get("x-business-id") || "";
+      let business = null;
+      if (rawBid) {
+        business = businesses.find((b) => b.id === Number(rawBid)) || null;
+        if (!business) return json({ error: "Usaha tidak ditemukan atau bukan milik Anda." }, 403);
+      } else if (businesses.length === 1) {
+        business = businesses[0];
+      }
+      if (!business) return json({ ...base, business: null });
+      const bid = business.id;
+      const today = todayId();
+      const month = today.slice(0, 7);
+      const { from: mFrom, to: mTo } = monthRange(month);
+      const totalsSql = `SELECT COUNT(*) AS count,
+                COALESCE(SUM(amount), 0) AS total,
+                COALESCE(SUM(CASE WHEN status = 'lunas' THEN amount ELSE 0 END), 0) AS total_lunas,
+                COALESCE(SUM(CASE WHEN status = 'dp' THEN amount ELSE 0 END), 0) AS total_dp,
+                COALESCE(SUM(CASE WHEN status = 'belum' THEN amount ELSE 0 END), 0) AS total_belum
+         FROM jobs WHERE business_id = ? AND job_date BETWEEN ? AND ?`;
+      const [customers, jobsRaw, prices, dailyTotals, monthlyTotals] = await Promise.all([
+        (async () => { await ensureNextVisitColumn(env); return qAll(env, "SELECT * FROM customers WHERE business_id = ? ORDER BY name COLLATE NOCASE ASC LIMIT 500", bid); })(),
+        (async () => {
+          await ensurePaidAmountColumn(env);
+          return qAll(env, `SELECT j.*, c.name AS customer_name, c.phone AS customer_phone
+                 FROM jobs j JOIN customers c ON c.id = j.customer_id WHERE j.business_id = ?
+                 ORDER BY j.job_date DESC, j.id DESC LIMIT 1000`, bid);
+        })(),
+        qAll(env, "SELECT * FROM service_prices WHERE business_id = ? ORDER BY service_type ASC", bid),
+        qFirst(env, totalsSql, bid, today, today),
+        qFirst(env, totalsSql, bid, mFrom, mTo),
+      ]);
+      const jobs = await attachJobItems(env, jobsRaw);
+      return json({
+        ...base,
+        business: { id: business.id, name: business.name, ...businessSettings(business) },
+        settings: businessSettings(business),
+        customers,
+        jobs,
+        prices,
+        totals: { daily: dailyTotals, monthly: monthlyTotals },
+      });
+    }
+
+    // ---- Profil usaha (businesses) ----
+    if (path === "/api/businesses" && method === "GET") {
+      const businesses = await listBusinessesFor(env, identity);
+      return json({ businesses: businesses.map((b) => ({ id: b.id, name: b.name, ...businessSettings(b) })) });
+    }
+
+    if (path === "/api/businesses" && method === "POST") {
+      const body = await readJson(request);
+      const name = String(body?.business_name || body?.name || "").trim();
+      if (!name || name.length > 200) return json({ error: "Nama usaha wajib diisi (maksimal 200 karakter)." }, 400);
+      if (identity.kind === "google") {
+        const count = (await qFirst(env, "SELECT COUNT(*) AS n FROM businesses WHERE owner_user_id = ?", identity.userId))?.n || 0;
+        if (count >= MAX_BUSINESSES_PER_USER) return json({ error: `Maksimal ${MAX_BUSINESSES_PER_USER} usaha per akun.` }, 400);
+      } else {
+        // Sesi password hanya boleh membuat usaha legacy bila belum ada.
+        const legacy = await qFirst(env, "SELECT id FROM businesses WHERE legacy = 1 LIMIT 1");
+        if (legacy) return json({ error: "Usaha lama sudah ada. Hubungkan akun Google untuk mengelola usaha." }, 403);
+      }
+      const v = validateBusinessProfile(body);
+      if (v.error) return json({ error: v.error }, 400);
+      const now = new Date().toISOString();
+      const values = { name, address: "", phone: "", website: "", logo: "", bank_name: "", bank_account_number: "", bank_account_holder: "", ...v.values };
+      const res = await qRun(env,
+        "INSERT INTO businesses (owner_user_id, legacy, name, address, phone, website, logo, bank_name, bank_account_number, bank_account_holder, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        identity.kind === "google" ? identity.userId : null, identity.kind === "password" ? 1 : 0,
+        values.name, values.address, values.phone, values.website, values.logo,
+        values.bank_name, values.bank_account_number, values.bank_account_holder, now, now);
+      const business = await qFirst(env, "SELECT * FROM businesses WHERE id = ?", res.meta.last_row_id);
+      return json({ business: { id: business.id, name: business.name, ...businessSettings(business) } }, 201);
+    }
+
+    const businessIdMatch = path.match(/^\/api\/businesses\/(\d+)$/);
+    if (businessIdMatch) {
+      const id = Number(businessIdMatch[1]);
+      const owned = await listBusinessesFor(env, identity);
+      const business = owned.find((b) => b.id === id);
+      if (!business) return json({ error: "Usaha tidak ditemukan atau bukan milik Anda." }, 403);
+      if (method === "PUT") {
+        const body = await readJson(request);
+        if (!body) return json({ error: "Body JSON tidak valid." }, 400);
+        const v = validateBusinessProfile(body);
+        if (v.error) return json({ error: v.error }, 400);
+        const sets = [];
+        const params = [];
+        for (const [key, value] of Object.entries(v.values)) {
+          sets.push(`${BUSINESS_COLUMNS[key]} = ?`);
+          params.push(value);
+        }
+        if (sets.length) {
+          sets.push("updated_at = ?");
+          params.push(new Date().toISOString());
+          await qRun(env, `UPDATE businesses SET ${sets.join(", ")} WHERE id = ?`, ...params, id);
+        }
+        const row = await qFirst(env, "SELECT * FROM businesses WHERE id = ?", id);
+        return json({ business: { id: row.id, name: row.name, ...businessSettings(row) } });
+      }
+      if (method === "DELETE") {
+        if (identity.kind !== "google") return json({ error: "Hapus usaha hanya bisa dari akun Google pemiliknya." }, 403);
+        await qRun(env, "DELETE FROM job_items WHERE job_id IN (SELECT id FROM jobs WHERE business_id = ?)", id);
+        await qRun(env, "DELETE FROM jobs WHERE business_id = ?", id);
+        await qRun(env, "DELETE FROM customers WHERE business_id = ?", id);
+        await qRun(env, "DELETE FROM service_prices WHERE business_id = ?", id);
+        await qRun(env, "DELETE FROM businesses WHERE id = ?", id);
+        return json({ ok: true });
+      }
+    }
+
+    // ---- Semua endpoint data di bawah ini wajib punya usaha aktif ----
+    const bizResolved = await resolveBusiness(request, env, identity);
+    if (bizResolved.error) return json({ error: bizResolved.error, code: bizResolved.code || undefined }, bizResolved.status);
+    const business = bizResolved.business;
+    const bid = business.id;
+
+    // ---- Pengaturan usaha: dibaca/ditulis dari baris businesses usaha
+    // aktif (bukan lagi tabel settings global). Bentuk respons tetap sama
+    // seperti dulu supaya form Pengaturan & invoice tidak berubah.
     if (path === "/api/settings" && (method === "GET" || method === "PUT")) {
-      await qRun(env, "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '')");
       if (method === "GET") {
-        const rows = await qAll(env, "SELECT key, value FROM settings");
-        const settings = {};
-        rows.forEach((r) => { settings[r.key] = r.value; });
-        return json({ settings });
+        return json({ settings: businessSettings(business) });
       }
       const body = await readJson(request);
       if (!body) return json({ error: "Body JSON tidak valid." }, 400);
-      const allowed = ["business_name", "business_address", "business_phone", "business_website", "business_logo", "bank_name", "bank_account_number", "bank_account_holder"];
-      for (const key of allowed) {
-        if (key in body) {
-          const value = String(body[key] || "").trim();
-          if (key === "business_logo") {
-            // Logo disimpan sebagai data URL (PNG/JPEG, sudah diperkecil di aplikasi).
-            if (value && !/^data:image\/(png|jpeg);base64,/.test(value)) return json({ error: "Logo harus berupa gambar PNG atau JPEG." }, 400);
-            if (value.length > 1500000) return json({ error: "Logo terlalu besar (maksimal sekitar 1 MB setelah diperkecil)." }, 400);
-          } else if (value.length > 200) {
-            return json({ error: `Isi ${key} maksimal 200 karakter.` }, 400);
-          }
-          await qRun(env, "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, value);
-        }
+      const v = validateBusinessProfile(body);
+      if (v.error) return json({ error: v.error }, 400);
+      const sets = [];
+      const params = [];
+      for (const [key, value] of Object.entries(v.values)) {
+        sets.push(`${BUSINESS_COLUMNS[key]} = ?`);
+        params.push(value);
       }
-      const rows = await qAll(env, "SELECT key, value FROM settings");
-      const settings = {};
-      rows.forEach((r) => { settings[r.key] = r.value; });
-      return json({ settings });
+      if (sets.length) {
+        sets.push("updated_at = ?");
+        params.push(new Date().toISOString());
+        await qRun(env, `UPDATE businesses SET ${sets.join(", ")} WHERE id = ?`, ...params, bid);
+      }
+      const row = await qFirst(env, "SELECT * FROM businesses WHERE id = ?", bid);
+      return json({ settings: businessSettings(row) });
     }
 
     // ---- Pelanggan ----
@@ -310,8 +692,8 @@ export async function handleApi(request, env) {
       await ensureNextVisitColumn(env);
       const q = (url.searchParams.get("q") || "").trim();
       const rows = q
-        ? await qAll(env, "SELECT * FROM customers WHERE name LIKE ? OR phone LIKE ? ORDER BY name COLLATE NOCASE ASC LIMIT 200", `%${q}%`, `%${q}%`)
-        : await qAll(env, "SELECT * FROM customers ORDER BY name COLLATE NOCASE ASC LIMIT 500");
+        ? await qAll(env, "SELECT * FROM customers WHERE business_id = ? AND (name LIKE ? OR phone LIKE ?) ORDER BY name COLLATE NOCASE ASC LIMIT 200", bid, `%${q}%`, `%${q}%`)
+        : await qAll(env, "SELECT * FROM customers WHERE business_id = ? ORDER BY name COLLATE NOCASE ASC LIMIT 500", bid);
       return json({ customers: rows });
     }
 
@@ -325,8 +707,8 @@ export async function handleApi(request, env) {
       const now = new Date().toISOString();
       const res = await qRun(
         env,
-        "INSERT INTO customers (name, address, phone, next_visit_date, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-        name, (body.address || "").trim(), (body.phone || "").trim(), nextVisit, now, now,
+        "INSERT INTO customers (business_id, name, address, phone, next_visit_date, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        bid, name, (body.address || "").trim(), (body.phone || "").trim(), nextVisit, now, now,
       );
       const row = await qFirst(env, "SELECT * FROM customers WHERE id = ?", res.meta.last_row_id);
       return json({ customer: row }, 201);
@@ -339,12 +721,12 @@ export async function handleApi(request, env) {
       if (!ids.length || ids.length > 200) return json({ error: "Pilih 1–200 pelanggan." }, 400);
       const ph = ids.map(() => "?").join(",");
       // Hitung dulu (bukan meta.changes, yang di runtime D1 tidak selalu terisi untuk DELETE).
-      const nJobs = (await qFirst(env, `SELECT COUNT(*) AS n FROM jobs WHERE customer_id IN (${ph})`, ...ids))?.n || 0;
-      const nCust = (await qFirst(env, `SELECT COUNT(*) AS n FROM customers WHERE id IN (${ph})`, ...ids))?.n || 0;
+      const nJobs = (await qFirst(env, `SELECT COUNT(*) AS n FROM jobs WHERE business_id = ? AND customer_id IN (${ph})`, bid, ...ids))?.n || 0;
+      const nCust = (await qFirst(env, `SELECT COUNT(*) AS n FROM customers WHERE business_id = ? AND id IN (${ph})`, bid, ...ids))?.n || 0;
       await ensureJobItemsTable(env);
-      await qRun(env, `DELETE FROM job_items WHERE job_id IN (SELECT id FROM jobs WHERE customer_id IN (${ph}))`, ...ids);
-      await qRun(env, `DELETE FROM jobs WHERE customer_id IN (${ph})`, ...ids);
-      await qRun(env, `DELETE FROM customers WHERE id IN (${ph})`, ...ids);
+      await qRun(env, `DELETE FROM job_items WHERE job_id IN (SELECT id FROM jobs WHERE business_id = ? AND customer_id IN (${ph}))`, bid, ...ids);
+      await qRun(env, `DELETE FROM jobs WHERE business_id = ? AND customer_id IN (${ph})`, bid, ...ids);
+      await qRun(env, `DELETE FROM customers WHERE business_id = ? AND id IN (${ph})`, bid, ...ids);
       return json({ ok: true, deleted_customers: nCust, deleted_jobs: nJobs });
     }
 
@@ -353,10 +735,10 @@ export async function handleApi(request, env) {
       const ids = [...new Set((body?.ids || []).map(Number).filter((n) => Number.isSafeInteger(n) && n > 0))];
       if (!ids.length || ids.length > 200) return json({ error: "Pilih 1–200 transaksi." }, 400);
       const ph = ids.map(() => "?").join(",");
-      const n = (await qFirst(env, `SELECT COUNT(*) AS n FROM jobs WHERE id IN (${ph})`, ...ids))?.n || 0;
+      const n = (await qFirst(env, `SELECT COUNT(*) AS n FROM jobs WHERE business_id = ? AND id IN (${ph})`, bid, ...ids))?.n || 0;
       await ensureJobItemsTable(env);
-      await qRun(env, `DELETE FROM job_items WHERE job_id IN (${ph})`, ...ids);
-      await qRun(env, `DELETE FROM jobs WHERE id IN (${ph})`, ...ids);
+      await qRun(env, `DELETE FROM job_items WHERE job_id IN (${ph}) AND job_id IN (SELECT id FROM jobs WHERE business_id = ?)`, ...ids, bid);
+      await qRun(env, `DELETE FROM jobs WHERE business_id = ? AND id IN (${ph})`, bid, ...ids);
       return json({ ok: true, deleted_jobs: n });
     }
 
@@ -368,7 +750,7 @@ export async function handleApi(request, env) {
         const name = (body?.name || "").trim();
         if (!name) return json({ error: "Nama pelanggan wajib diisi." }, 400);
         await ensureNextVisitColumn(env);
-        const existing = await qFirst(env, "SELECT * FROM customers WHERE id = ?", id);
+        const existing = await qFirst(env, "SELECT * FROM customers WHERE id = ? AND business_id = ?", id, bid);
         if (!existing) return json({ error: "Pelanggan tidak ditemukan." }, 404);
         // Bila kunci next_visit_date tidak dikirim, jadwal lama dipertahankan
         // (PUT parsial dari pemanggil lain tidak boleh menghapus jadwal).
@@ -382,8 +764,8 @@ export async function handleApi(request, env) {
         return json({ customer: row });
       }
       if (method === "DELETE") {
-        await qRun(env, "DELETE FROM jobs WHERE customer_id = ?", id);
-        await qRun(env, "DELETE FROM customers WHERE id = ?", id);
+        await qRun(env, "DELETE FROM jobs WHERE business_id = ? AND customer_id = ?", bid, id);
+        await qRun(env, "DELETE FROM customers WHERE business_id = ? AND id = ?", bid, id);
         return json({ ok: true });
       }
     }
@@ -395,8 +777,8 @@ export async function handleApi(request, env) {
       const customerId = url.searchParams.get("customer_id") || "";
       const status = url.searchParams.get("status") || "";
       let sql = `SELECT j.*, c.name AS customer_name, c.phone AS customer_phone
-                 FROM jobs j JOIN customers c ON c.id = j.customer_id WHERE 1 = 1`;
-      const params = [];
+                 FROM jobs j JOIN customers c ON c.id = j.customer_id WHERE j.business_id = ?`;
+      const params = [bid];
       if (from && isValidDate(from)) { sql += " AND j.job_date >= ?"; params.push(from); }
       if (to && isValidDate(to)) { sql += " AND j.job_date <= ?"; params.push(to); }
       if (customerId) { sql += " AND j.customer_id = ?"; params.push(Number(customerId)); }
@@ -430,12 +812,12 @@ export async function handleApi(request, env) {
       await ensurePaidAmountColumn(env);
       const paidV = validatePaidAmount(body?.paid_amount, amount);
       if (paidV.error) return json({ error: paidV.error }, 400);
-      const customer = await qFirst(env, "SELECT id FROM customers WHERE id = ?", customerId);
+      const customer = await qFirst(env, "SELECT id FROM customers WHERE id = ? AND business_id = ?", customerId, bid);
       if (!customer) return json({ error: "Pelanggan tidak ditemukan." }, 404);
       const now = new Date().toISOString();
       const res = await qRun(env,
-        "INSERT INTO jobs (customer_id, service_type, amount, paid_amount, status, job_date, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        customerId, serviceType, amount, paidV.paid, status, jobDate, (body.note || "").trim(), now, now);
+        "INSERT INTO jobs (business_id, customer_id, service_type, amount, paid_amount, status, job_date, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        bid, customerId, serviceType, amount, paidV.paid, status, jobDate, (body.note || "").trim(), now, now);
       await saveJobItems(env, res.meta.last_row_id, items);
       const row = await qFirst(env, "SELECT * FROM jobs WHERE id = ?", res.meta.last_row_id);
       return json({ job: { ...row, items } }, 201);
@@ -465,7 +847,7 @@ export async function handleApi(request, env) {
           return json({ error: "Data transaksi tidak valid." }, 400);
         }
         await ensurePaidAmountColumn(env);
-        const existing = await qFirst(env, "SELECT * FROM jobs WHERE id = ?", id);
+        const existing = await qFirst(env, "SELECT * FROM jobs WHERE id = ? AND business_id = ?", id, bid);
         if (!existing) return json({ error: "Transaksi tidak ditemukan." }, 404);
         const paidV = validatePaidAmount(body?.paid_amount !== undefined ? body.paid_amount : existing.paid_amount, amount);
         if (paidV.error) return json({ error: paidV.error }, 400);
@@ -477,8 +859,8 @@ export async function handleApi(request, env) {
       }
       if (method === "DELETE") {
         await ensureJobItemsTable(env);
-        await qRun(env, "DELETE FROM job_items WHERE job_id = ?", id);
-        await qRun(env, "DELETE FROM jobs WHERE id = ?", id);
+        await qRun(env, "DELETE FROM job_items WHERE job_id = ? AND job_id IN (SELECT id FROM jobs WHERE business_id = ?)", id, bid);
+        await qRun(env, "DELETE FROM jobs WHERE id = ? AND business_id = ?", id, bid);
         return json({ ok: true });
       }
     }
@@ -492,7 +874,7 @@ export async function handleApi(request, env) {
     }
     if (path === "/api/service-prices" && method === "GET") {
       await ensureServicePricesTable(env);
-      const rows = await qAll(env, "SELECT * FROM service_prices ORDER BY service_type ASC");
+      const rows = await qAll(env, "SELECT * FROM service_prices WHERE business_id = ? ORDER BY service_type ASC", bid);
       return json({ prices: rows });
     }
     if (path === "/api/service-prices" && method === "POST") {
@@ -505,12 +887,12 @@ export async function handleApi(request, env) {
       if (!ITEM_UNITS.includes(unit)) return json({ error: "Satuan tidak valid (kubik/strip/pcs/paket/tanki/titik)." }, 400);
       if (!Number.isSafeInteger(unitPrice) || unitPrice < 0) return json({ error: "Harga satuan harus angka >= 0." }, 400);
       const now = new Date().toISOString();
-      const existing = await qFirst(env, "SELECT * FROM service_prices WHERE LOWER(service_type) = LOWER(?)", serviceType);
+      const existing = await qFirst(env, "SELECT * FROM service_prices WHERE business_id = ? AND LOWER(service_type) = LOWER(?)", bid, serviceType);
       if (existing) {
-        await qRun(env, "UPDATE service_prices SET service_type = ?, unit = ?, unit_price = ?, updated_at = ? WHERE id = ?", serviceType, unit, unitPrice, now, existing.id);
-        return json({ price: await qFirst(env, "SELECT * FROM service_prices WHERE id = ?", existing.id) });
+        await qRun(env, "UPDATE service_prices SET service_type = ?, unit = ?, unit_price = ?, updated_at = ? WHERE id = ? AND business_id = ?", serviceType, unit, unitPrice, now, existing.id, bid);
+        return json({ price: await qFirst(env, "SELECT * FROM service_prices WHERE id = ? AND business_id = ?", existing.id, bid) });
       }
-      const res = await qRun(env, "INSERT INTO service_prices (service_type, unit, unit_price, created_at, updated_at) VALUES (?, ?, ?, ?, ?)", serviceType, unit, unitPrice, now, now);
+      const res = await qRun(env, "INSERT INTO service_prices (business_id, service_type, unit, unit_price, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", bid, serviceType, unit, unitPrice, now, now);
       return json({ price: await qFirst(env, "SELECT * FROM service_prices WHERE id = ?", res.meta.last_row_id) }, 201);
     }
     const priceIdMatch = path.match(/^\/api\/service-prices\/(\d+)$/);
@@ -525,15 +907,15 @@ export async function handleApi(request, env) {
         if (!serviceType || serviceType.length > 100) return json({ error: "Nama jasa wajib diisi." }, 400);
         if (!ITEM_UNITS.includes(unit)) return json({ error: "Satuan tidak valid (kubik/strip/pcs/paket/tanki/titik)." }, 400);
         if (!Number.isSafeInteger(unitPrice) || unitPrice < 0) return json({ error: "Harga satuan harus angka >= 0." }, 400);
-        const clash = await qFirst(env, "SELECT * FROM service_prices WHERE LOWER(service_type) = LOWER(?) AND id != ?", serviceType, id);
+        const clash = await qFirst(env, "SELECT * FROM service_prices WHERE business_id = ? AND LOWER(service_type) = LOWER(?) AND id != ?", bid, serviceType, id);
         if (clash) return json({ error: "Nama jasa sudah ada di daftar harga." }, 400);
-        await qRun(env, "UPDATE service_prices SET service_type = ?, unit = ?, unit_price = ?, updated_at = ? WHERE id = ?", serviceType, unit, unitPrice, new Date().toISOString(), id);
-        const row = await qFirst(env, "SELECT * FROM service_prices WHERE id = ?", id);
+        await qRun(env, "UPDATE service_prices SET service_type = ?, unit = ?, unit_price = ?, updated_at = ? WHERE id = ? AND business_id = ?", serviceType, unit, unitPrice, new Date().toISOString(), id, bid);
+        const row = await qFirst(env, "SELECT * FROM service_prices WHERE id = ? AND business_id = ?", id, bid);
         if (!row) return json({ error: "Harga jasa tidak ditemukan." }, 404);
         return json({ price: row });
       }
       if (method === "DELETE") {
-        await qRun(env, "DELETE FROM service_prices WHERE id = ?", id);
+        await qRun(env, "DELETE FROM service_prices WHERE id = ? AND business_id = ?", id, bid);
         return json({ ok: true });
       }
     }
@@ -603,35 +985,52 @@ export async function handleApi(request, env) {
           settingsOut[key] = value.trim();
         }
       }
-      // Validasi lolos semua — baru sekarang ganti data.
-      await qRun(env, "CREATE TABLE IF NOT EXISTS customers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, address TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', next_visit_date TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
+      // Validasi lolos semua — baru sekarang ganti data USAHA AKTIF ini saja
+      // (usaha lain tidak tersentuh). ID dari file cadangan TIDAK dipakai:
+      // tiap baris dapat id baru dan relasi pelanggan–transaksi dipetakan
+      // ulang, supaya restore tidak bentrok dengan id usaha lain.
+      await qRun(env, "CREATE TABLE IF NOT EXISTS customers (id INTEGER PRIMARY KEY AUTOINCREMENT, business_id INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL, address TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', next_visit_date TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
       await ensureNextVisitColumn(env);
-      await qRun(env, "CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER NOT NULL REFERENCES customers(id), service_type TEXT NOT NULL, amount INTEGER NOT NULL DEFAULT 0, paid_amount INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'lunas', job_date TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
+      await qRun(env, "CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, business_id INTEGER NOT NULL DEFAULT 0, customer_id INTEGER NOT NULL REFERENCES customers(id), service_type TEXT NOT NULL, amount INTEGER NOT NULL DEFAULT 0, paid_amount INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'lunas', job_date TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
       await ensureServicePricesTable(env);
       await ensureJobItemsTable(env);
-      await qRun(env, "DELETE FROM job_items");
-      await qRun(env, "DELETE FROM jobs");
-      await qRun(env, "DELETE FROM customers");
-      await qRun(env, "DELETE FROM service_prices");
-      await qRun(env, "DELETE FROM settings");
+      await qRun(env, "DELETE FROM job_items WHERE job_id IN (SELECT id FROM jobs WHERE business_id = ?)", bid);
+      await qRun(env, "DELETE FROM jobs WHERE business_id = ?", bid);
+      await qRun(env, "DELETE FROM customers WHERE business_id = ?", bid);
+      await qRun(env, "DELETE FROM service_prices WHERE business_id = ?", bid);
       const now = new Date().toISOString();
+      const custIdMap = new Map();
       for (const c of body.customers) {
-        await qRun(env, "INSERT INTO customers (id, name, address, phone, next_visit_date, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", c.id, c.name.trim(), (c.address || "").trim(), (c.phone || "").trim(), c.next_visit_date || null, c.created_at || now, c.updated_at || now);
+        const res = await qRun(env, "INSERT INTO customers (business_id, name, address, phone, next_visit_date, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)", bid, c.name.trim(), (c.address || "").trim(), (c.phone || "").trim(), c.next_visit_date || null, c.created_at || now, c.updated_at || now);
+        custIdMap.set(c.id, res.meta.last_row_id);
       }
       for (const p of prices) {
-        await qRun(env, "INSERT INTO service_prices (id, service_type, unit, unit_price, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", p.id, p.service_type.trim(), p.unit, p.unit_price, p.created_at || now, p.updated_at || now);
+        await qRun(env, "INSERT INTO service_prices (business_id, service_type, unit, unit_price, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", bid, p.service_type.trim(), p.unit, p.unit_price, p.created_at || now, p.updated_at || now);
       }
-      for (const [key, value] of Object.entries(settingsOut)) {
-        await qRun(env, "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, value);
+      {
+        const sets = [];
+        const params = [];
+        for (const [key, value] of Object.entries(settingsOut)) {
+          sets.push(`${BUSINESS_COLUMNS[key]} = ?`);
+          params.push(value);
+        }
+        if (sets.length) {
+          sets.push("updated_at = ?");
+          params.push(now);
+          await qRun(env, `UPDATE businesses SET ${sets.join(", ")} WHERE id = ?`, ...params, bid);
+        }
       }
       for (const j of body.jobs) {
         const paid = j.paid_amount === undefined ? 0 : j.paid_amount;
-        await qRun(env, "INSERT INTO jobs (id, customer_id, service_type, amount, paid_amount, status, job_date, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", j.id, j.customer_id, j.service_type.trim(), j.amount, paid, j.status, j.job_date, (j.note || "").trim(), j.created_at || now, j.updated_at || now);
+        const newCustId = custIdMap.get(j.customer_id);
+        if (!newCustId) continue;
+        const res = await qRun(env, "INSERT INTO jobs (business_id, customer_id, service_type, amount, paid_amount, status, job_date, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", bid, newCustId, j.service_type.trim(), j.amount, paid, j.status, j.job_date, (j.note || "").trim(), j.created_at || now, j.updated_at || now);
+        const newJobId = res.meta.last_row_id;
         const items = Array.isArray(j.items) && j.items.length
           ? j.items
           : [{ service_type: j.service_type, qty: 1, unit: "paket", unit_price: j.amount, amount: j.amount }];
         for (const it of items) {
-          await qRun(env, "INSERT INTO job_items (job_id, service_type, qty, unit, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?)", j.id, it.service_type, it.qty, it.unit, it.unit_price, it.amount);
+          await qRun(env, "INSERT INTO job_items (job_id, service_type, qty, unit, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?)", newJobId, it.service_type, it.qty, it.unit, it.unit_price, it.amount);
         }
       }
       return json({ ok: true, restored_customers: body.customers.length, restored_jobs: body.jobs.length, restored_prices: prices.length });
@@ -659,10 +1058,10 @@ export async function handleApi(request, env) {
                 COALESCE(SUM(CASE WHEN status = 'lunas' THEN amount ELSE 0 END), 0) AS total_lunas,
                 COALESCE(SUM(CASE WHEN status = 'dp' THEN amount ELSE 0 END), 0) AS total_dp,
                 COALESCE(SUM(CASE WHEN status = 'belum' THEN amount ELSE 0 END), 0) AS total_belum
-         FROM jobs WHERE job_date BETWEEN ? AND ?`, from, to);
+         FROM jobs WHERE business_id = ? AND job_date BETWEEN ? AND ?`, bid, from, to);
       const jobsRaw = await qAll(env,
         `SELECT j.*, c.name AS customer_name FROM jobs j JOIN customers c ON c.id = j.customer_id
-         WHERE j.job_date BETWEEN ? AND ? ORDER BY j.job_date DESC, j.id DESC`, from, to);
+         WHERE j.business_id = ? AND j.job_date BETWEEN ? AND ? ORDER BY j.job_date DESC, j.id DESC`, bid, from, to);
       const jobs = await attachJobItems(env, jobsRaw);
       const byMap = {};
       jobs.forEach((j) => j.items.forEach((it) => {
@@ -681,7 +1080,7 @@ export async function handleApi(request, env) {
       if (!isValidDate(from) || !isValidDate(to)) return json({ error: "Rentang from/to tidak valid." }, 400);
       const jobsRaw = await qAll(env,
         `SELECT j.*, c.name AS customer_name, c.phone FROM jobs j JOIN customers c ON c.id = j.customer_id
-         WHERE j.job_date BETWEEN ? AND ? ORDER BY j.job_date ASC, j.id ASC`, from, to);
+         WHERE j.business_id = ? AND j.job_date BETWEEN ? AND ? ORDER BY j.job_date ASC, j.id ASC`, bid, from, to);
       const jobs = await attachJobItems(env, jobsRaw);
       const lines = ["tanggal,nama_pelanggan,telepon_wa,jenis_jasa,jumlah,satuan,harga_satuan_rp,subtotal_rp,status,catatan,sudah_dibayar_rp,sisa_rp"];
       for (const j of jobs) {

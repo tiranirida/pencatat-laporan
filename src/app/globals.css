@@ -23,7 +23,7 @@ body {
   background-image: radial-gradient(#e60012 1px, transparent 1.5px);
   background-size: 14px 14px;
 }
-input, select {
+input, select, textarea {
   background: #1c1c1c;
   color: #fafafa;
   border: 1px solid #2a2a2a;
@@ -31,8 +31,12 @@ input, select {
   padding: 10px 12px;
   width: 100%;
   font-size: 1rem;
+  font-family: inherit;
 }
-input:focus, select:focus {
+textarea {
+  resize: vertical;
+}
+input:focus, select:focus, textarea:focus {
   outline: 2px solid #e60012;
   outline-offset: 1px;
   border-color: #e60012;
@@ -70,7 +74,8 @@ input[type="month"]::-webkit-calendar-picker-indicator {
   color: #374151;
 }
 .theme-light input,
-.theme-light select {
+.theme-light select,
+.theme-light textarea {
   background: #ffffff;
   color: #111827;
   border-color: #d0d5dd;

@@ -22,9 +22,18 @@ Webapp pribadi untuk mencatat pelanggan jasa dan laporan pemasukan harian sampai
 - PWA: manifest + service worker (shell bisa dibuka offline, API tidak pernah di-cache), menu Install aplikasi ada di Profil & Pengaturan saat browser menawarkan instalasi
 - Ekspor laporan ke CSV
 
-## Login: hanya dari Cloudflare env
+## Login: password lama + Google OAuth (multi-tenant)
 
-Tidak ada tabel user, tidak ada halaman daftar, dan tidak ada kredensial di repo ini. Login dicek terhadap environment variable yang di-set di Cloudflare saja.
+Ada dua cara masuk, dan data tiap usaha terpisah total (tabel `businesses`
++ kolom `business_id` di pelanggan, transaksi, dan daftar harga):
+
+1. **Google OAuth — pendaftaran terbuka.** Siapa pun dengan akun Google bisa
+   daftar lewat tombol "Login dengan Google", lalu membuat profil usahanya
+   sendiri. Setiap pemilik hanya melihat usahanya (maksimal 5 usaha per akun).
+2. **Password lama (satu akun admin).** Login ini mengakses usaha legacy —
+   data yang sudah ada sebelum multi-tenant. Dari menu profil, akun password
+   bisa "Hubungkan akun Google" supaya usaha legacy itu pindah ke akun
+   Google-nya.
 
 Di Dashboard Pages project ini, buka **Settings > Functions > Environment variables**, lalu set:
 
@@ -33,16 +42,19 @@ Di Dashboard Pages project ini, buka **Settings > Functions > Environment variab
 | `ADMIN_USERNAME` | Variable | Username login, misal `andro` |
 | `ADMIN_PASSWORD_HASH` | Secret (terenkripsi) | SHA-256 hex dari password |
 | `SESSION_SECRET` | Secret (terenkripsi) | String acak untuk menandatangani cookie sesi |
+| `GOOGLE_CLIENT_ID` | Variable | Client ID dari Google Cloud (OAuth 2.0) |
+| `GOOGLE_CLIENT_SECRET` | Secret (terenkripsi) | Client secret dari Google Cloud |
 
-Buat nilainya di terminal sendiri (jangan kirim password ke chat / commit ke repo):
-
-```bash
-# Hash password (ganti PASSWORD_KAMU, tanpa spasi tambahan):
-printf '%s' 'PASSWORD_KAMU' | sha256sum
-
-# Secret sesi:
-openssl rand -hex 32
-```
+Google OAuth (sekali saja, di [Google Cloud Console](https://console.cloud.google.com/)):
+buat project, aktifkan **OAuth consent screen** (User type External, scope
+`openid email profile` — scope non-sensitif, tanpa verifikasi), lalu
+**APIs & Services > Credentials > Create OAuth client ID** (tipe Web
+application). Authorized redirect URI harus persis:
+`https://laporan.androwee.com/api/auth/google/callback`
+(dan `http://localhost:8787/api/auth/google/callback` bila dites lokal).
+Karena pendaftarannya terbuka untuk siapa pun, ubah aplikasi OAuth ke
+**Production** di consent screen — kalau masih Testing, hanya test user yang
+bisa login dan tokennya kedaluwarsa 7 hari.
 
 Sesi berlaku 7 hari lewat cookie HttpOnly. Kalau env belum di-set, halaman login akan menampilkan pesan "Login belum dikonfigurasi" — itu sengaja, bukan bug.
 

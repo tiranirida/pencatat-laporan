@@ -7,7 +7,7 @@
 // - Navigasi & aset non-hash: network-first, cache hanya cadangan offline.
 // - Chunk _next/ (hash di URL = isinya tidak pernah berubah): cache-first, aman.
 // - API (/api/*): TIDAK pernah di-cache, selalu dari jaringan.
-const CACHE = "pencatat-laporan-v2";
+const CACHE = "pencatat-laporan-v3";
 const SHELL = ["/", "/manifest.json", "/logo-dark.png", "/logo-light.png", "/icon-192.png", "/icon-512.png"];
 
 self.addEventListener("install", (event) => {

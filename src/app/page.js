@@ -8,8 +8,20 @@ const todayWib = () => {
   return d.toISOString().slice(0, 10);
 };
 
+const BUSINESS_KEY = "pencatat-business";
+
+function storedBusinessId() {
+  try { return localStorage.getItem(BUSINESS_KEY) || ""; } catch { return ""; }
+}
+
 async function api(path, options = {}) {
-  const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
+  let url = path;
+  const bid = storedBusinessId();
+  const scoped = bid && path.startsWith("/api/")
+    && !path.startsWith("/api/me") && !path.startsWith("/api/businesses")
+    && !path.startsWith("/api/auth") && !path.startsWith("/api/login") && !path.startsWith("/api/logout");
+  if (scoped) url = path + (path.includes("?") ? "&" : "?") + "business_id=" + encodeURIComponent(bid);
+  const res = await fetch(url, { headers: { "Content-Type": "application/json" }, ...options });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `Gagal memuat ${path}`);
   return data;
@@ -90,9 +102,6 @@ function monthToRange(monthStr) {
 export default function Home() {
   const [view, setView] = useState("loading");
   const [username, setUsername] = useState("");
-  const [loginError, setLoginError] = useState("");
-  const [loginForm, setLoginForm] = useState({ username: "", password: "" });
-  const [showPassword, setShowPassword] = useState(false);
   const [tab, setTab] = useState("dashboard");
   const [error, setError] = useState("");
   const [dash, setDash] = useState(null);
@@ -118,6 +127,17 @@ export default function Home() {
   const [selectedCustomers, setSelectedCustomers] = useState([]);
   const [selectedJobs, setSelectedJobs] = useState([]);
   const [detailJob, setDetailJob] = useState(null);
+  const [businesses, setBusinesses] = useState([]);
+  const [activeBusiness, setActiveBusiness] = useState(null);
+  const [authKind, setAuthKind] = useState("");
+  const [showBusinessModal, setShowBusinessModal] = useState(false);
+  const [businessForm, setBusinessForm] = useState({ business_name: "", business_address: "", business_phone: "", business_website: "", bank_name: "", bank_account_number: "", bank_account_holder: "" });
+  const [businessError, setBusinessError] = useState("");
+  const [invoicePreview, setInvoicePreview] = useState(null);
+  const [offerForm, setOfferForm] = useState(null);
+  const [offerJob, setOfferJob] = useState(null);
+  const [offerPreview, setOfferPreview] = useState(null);
+  const [offerEditField, setOfferEditField] = useState(null);
   const [historyCustomer, setHistoryCustomer] = useState(null);
   const [historyJobs, setHistoryJobs] = useState(null);
   const [duplicateWarning, setDuplicateWarning] = useState(null);
@@ -219,6 +239,62 @@ export default function Home() {
     try { const data = await api("/api/service-prices"); setServicePrices(data.prices || []); } catch (e) { /* daftar harga opsional, abaikan */ }
   }, []);
 
+  // ---- Bootstrap: satu panggilan untuk semua data awal, plus cache
+  // lokal supaya laporan langsung tampil saat aplikasi dibuka (data
+  // terakhir yang tersimpan), lalu disegarkan dari server di belakang.
+  const BOOTSTRAP_CACHE_KEY = "pencatat-bootstrap";
+  const readBootstrapCache = () => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(BOOTSTRAP_CACHE_KEY) || "null");
+      if (!parsed || !parsed.data || !parsed.businessId) return null;
+      return parsed;
+    } catch { return null; }
+  };
+  const writeBootstrapCache = (businessId, data) => {
+    try { localStorage.setItem(BOOTSTRAP_CACHE_KEY, JSON.stringify({ businessId: String(businessId), savedAt: Date.now(), data })); } catch { /* penyimpanan penuh: abaikan */ }
+  };
+  const clearBootstrapCache = () => { try { localStorage.removeItem(BOOTSTRAP_CACHE_KEY); } catch {} };
+
+  // Isi semua state tampilan awal dari satu payload bootstrap
+  // (dipakai untuk cache lokal maupun hasil fetch segar).
+  const applyBootstrapData = useCallback((data) => {
+    if (!data || !data.business) return;
+    const cust = data.customers || [];
+    const allJobs = data.jobs || [];
+    setUsername(data.username || "");
+    setAuthKind(data.auth || "");
+    setBusinesses(data.businesses || []);
+    setActiveBusiness(data.business);
+    setCustomers(cust);
+    setJobs(allJobs);
+    setSettings(data.settings || {});
+    setSettingsForm({
+      business_name: data.settings?.business_name || "",
+      business_address: data.settings?.business_address || "",
+      business_phone: data.settings?.business_phone || "",
+      business_website: data.settings?.business_website || "",
+      business_logo: data.settings?.business_logo || "",
+    });
+    setServicePrices(data.prices || []);
+    const trend = groupByDate(allJobs);
+    const outstandingJobs = allJobs.filter((j) => j.status !== "lunas" && Math.max(0, Number(j.amount) - Number(j.paid_amount || 0)) > 0);
+    setDash({
+      today: Number(data.totals?.daily?.total || 0),
+      month: Number(data.totals?.monthly?.total || 0),
+      customers: cust.length, jobs: allJobs.length,
+      outstanding: outstandingJobs.reduce((s, j) => s + Math.max(0, Number(j.amount) - Number(j.paid_amount || 0)), 0),
+      outstandingCount: outstandingJobs.length,
+      schedules: cust.filter((c) => c.next_visit_date).sort((a, b) => (a.next_visit_date < b.next_visit_date ? -1 : 1)),
+      recent: allJobs.slice(0, 10),
+      trendDates: trend.dates.slice(-10), trendValues: trend.values.slice(-10),
+      status: statusParts({
+        total_lunas: allJobs.filter((j) => j.status === "lunas").reduce((s, j) => s + Number(j.amount), 0),
+        total_dp: allJobs.filter((j) => j.status === "dp").reduce((s, j) => s + Number(j.amount), 0),
+        total_belum: allJobs.filter((j) => j.status === "belum").reduce((s, j) => s + Number(j.amount), 0),
+      }),
+    });
+  }, []);
+
   const submitPrice = async (e) => {
     e.preventDefault();
     try {
@@ -260,17 +336,39 @@ export default function Home() {
 
   useEffect(() => {
     (async () => {
-      try {
-        const me = await api("/api/me");
-        setUsername(me.username);
+      // Tampilkan data terakhir yang tersimpan di perangkat dulu supaya
+      // laporan langsung muncul, lalu segarkan dari server di belakang.
+      const stored = storedBusinessId();
+      const cached = readBootstrapCache();
+      const cacheUsable = cached && (!stored || String(cached.businessId) === String(stored));
+      if (cacheUsable) {
+        applyBootstrapData(cached.data);
         setView("app");
-        loadDashboard();
-        loadCustomers();
-        loadSettings();
-        loadServicePrices();
-      } catch { setView("login"); }
+      }
+      try {
+        let data = await api("/api/bootstrap");
+        if (!data.business && (data.businesses || []).length > 1) {
+          const active = (data.businesses || []).find((b) => String(b.id) === String(stored)) || data.businesses[0];
+          try { localStorage.setItem(BUSINESS_KEY, String(active.id)); } catch {}
+          data = await api("/api/bootstrap");
+        }
+        if (!data.business) { setView("onboarding"); return; }
+        try { localStorage.setItem(BUSINESS_KEY, String(data.business.id)); } catch {}
+        applyBootstrapData(data);
+        writeBootstrapCache(data.business.id, data);
+        setView("app");
+      } catch (e) {
+        if (String(e?.message || "").includes("Belum login")) {
+          clearBootstrapCache();
+          setView("login");
+        } else if (!cacheUsable) {
+          setView("login");
+        }
+        // Gagal jaringan tapi ada cache: biarkan cache tampil, data
+        // disegarkan saat aplikasi dibuka berikutnya.
+      }
     })();
-  }, [loadDashboard, loadCustomers, loadSettings, loadServicePrices]);
+  }, [applyBootstrapData]);
 
   useEffect(() => { if (tab === "customers") loadCustomers(search); }, [search, tab, loadCustomers]);
 
@@ -318,23 +416,27 @@ export default function Home() {
     document.documentElement.classList.toggle("theme-light", next === "light");
   };
 
-  const handleLogin = async (e) => {
-    e.preventDefault();
-    setLoginError("");
-    try {
-      await api("/api/login", { method: "POST", body: JSON.stringify(loginForm) });
-      const me = await api("/api/me");
-      setUsername(me.username);
-      setView("app");
-      loadDashboard();
-      loadCustomers();
-      loadSettings();
-    } catch (err) { setLoginError(err.message); }
-  };
-
   const handleLogout = async () => {
     await api("/api/logout", { method: "POST" }).catch(() => {});
+    try { localStorage.removeItem(BUSINESS_KEY); } catch {}
+    clearBootstrapCache();
     location.reload();
+  };
+
+  const switchBusiness = (id) => {
+    try { localStorage.setItem(BUSINESS_KEY, String(id)); } catch {}
+    location.reload();
+  };
+
+  const submitBusiness = async (e) => {
+    e.preventDefault();
+    setBusinessError("");
+    try {
+      const data = await api("/api/businesses", { method: "POST", body: JSON.stringify(businessForm) });
+      try { localStorage.setItem(BUSINESS_KEY, String(data.business.id)); } catch {}
+      setShowBusinessModal(false);
+      location.reload();
+    } catch (err) { setBusinessError(err.message); }
   };
 
   // Cadangan data: unduh satu file JSON berisi pelanggan, transaksi
@@ -872,6 +974,23 @@ export default function Home() {
       }
       y += 6;
       doc.setFontSize(10); doc.text("Invoice ini dibuat dari aplikasi Pencatat Laporan.", 14, y);
+      // Watermark di tengah dokumen, orientasi normal (tidak miring):
+      // LUNAS merah bila sudah lunas, BELUM LUNAS abu-abu bila belum lunas.
+      {
+        const wmIsLunas = job.status === "lunas";
+        const wmText = wmIsLunas ? "LUNAS" : "BELUM LUNAS";
+        try { doc.setGState(new doc.GState({ opacity: wmIsLunas ? 0.13 : 0.16 })); } catch { /* jsPDF tanpa GState: lanjut dengan warna */ }
+        if (wmIsLunas) doc.setTextColor(230, 0, 18); else doc.setTextColor(150, 150, 150);
+        doc.setFont("helvetica", "bold");
+        let wmSize = 70;
+        doc.setFontSize(wmSize);
+        const wmWidth = doc.getTextWidth(wmText) || 1;
+        wmSize = Math.min(wmIsLunas ? 80 : 60, Math.max(40, wmSize * 150 / wmWidth));
+        doc.setFontSize(wmSize);
+        doc.text(wmText, 105, 150, { align: "center" });
+        try { doc.setGState(new doc.GState({ opacity: 1 })); } catch { /* abaikan */ }
+        doc.setTextColor(0, 0, 0);
+      }
       return doc;
   };
 
@@ -881,6 +1000,215 @@ export default function Home() {
       doc.save(`invoice-${job.id}-${job.job_date}.pdf`);
     } catch (err) { setError(`Gagal membuat invoice: ${err.message}`); }
   };
+
+  // Preview invoice sebagai HTML (instan, tanpa unduh apa-apa): PDF.js
+  // terlalu berat di koneksi lambat dan canvas-nya melebar di HP, jadi
+  // isi invoice ditampilkan langsung dari data yang sudah dimuat.
+  // PDF aslinya tetap dipakai untuk Unduh / Kirim WA / Buka di PDF viewer.
+  const previewInvoice = (job) => {
+    setDetailJob(null);
+    setInvoicePreview({ job });
+  };
+
+  const closeInvoicePreview = () => {
+    setInvoicePreview(null);
+  };
+
+  const openPdfViewer = async (job) => {
+    try {
+      const doc = await buildInvoiceDoc(job);
+      const url = doc.output("bloburl");
+      window.open(url, "_blank", "noopener");
+    } catch (err) { setError(`Gagal membuka PDF: ${err.message}`); }
+  };
+
+  // ---------- Surat Penawaran Harga ----------
+  // Nomor surat berurutan per usaha, disimpan lokal di perangkat
+  // (kunci: pencatat-offer-seq-<business_id>), naik tiap kali surat
+  // diunduh/dibagikan. Format: 001/SPH/<inisial usaha>, mis. 001/SPH/SR.
+  const offerInitials = () => {
+    const name = (settings.business_name || "").replace(/^(cv|pt|ud|pd)\.?\s+/i, "");
+    const init = name.split(/\s+/).filter(Boolean).slice(0, 2).map((w) => w[0]).join("").toUpperCase();
+    return init || "XX";
+  };
+  const offerSeqKey = () => `pencatat-offer-seq-${storedBusinessId() || "default"}`;
+  const nextOfferSeq = () => {
+    try { return Math.max(1, Number(localStorage.getItem(offerSeqKey())) || 1); } catch { return 1; }
+  };
+  const bumpOfferSeq = () => {
+    try { localStorage.setItem(offerSeqKey(), String(nextOfferSeq() + 1)); } catch { /* abaikan */ }
+  };
+  const formatDateId = (iso) => {
+    const months = ["Januari", "Februari", "Maret", "April", "Mei", "Juni", "Juli", "Agustus", "September", "Oktober", "November", "Desember"];
+    const [y, m, d] = String(iso || "").split("-");
+    if (!y || !m || !d) return String(iso || "");
+    return `${Number(d)} ${months[Number(m) - 1] || ""} ${y}`;
+  };
+  const cityFromAddress = (addr) => {
+    const parts = String(addr || "").split(",").map((s) => s.trim()).filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : "";
+  };
+
+  const openOfferForm = (job) => {
+    const customer = customers.find((c) => c.id === Number(job.customer_id)) || {};
+    const seq = nextOfferSeq();
+    const items = job.items?.length
+      ? job.items
+      : [{ service_type: job.service_type, qty: 1, unit: "paket", unit_price: job.amount, amount: job.amount }];
+    const jobServiceNames = items.map((it) => it.service_type).filter(Boolean);
+    const rows = (servicePrices.length ? servicePrices : items.map((it) => ({ service_type: it.service_type, unit: it.unit || "paket", unit_price: it.unit_price })))
+      .map((p) => ({ service_type: p.service_type, unit: p.unit || "paket", unit_price: Number(p.unit_price || 0), checked: jobServiceNames.includes(p.service_type) }));
+    jobServiceNames.forEach((name) => {
+      if (!rows.some((r) => r.service_type === name)) {
+        const it = items.find((i) => i.service_type === name);
+        rows.push({ service_type: name, unit: it?.unit || "paket", unit_price: Number(it?.unit_price || 0), checked: true });
+      }
+    });
+    const businessName = settings.business_name || "Pencatat Laporan";
+    const serviceList = rows.filter((r) => r.checked).map((r) => r.service_type).join(", ");
+    const phone = settings.business_phone || "";
+    const website = settings.business_website || "";
+    setDetailJob(null);
+    setOfferJob(job);
+    setOfferForm({
+      number: `${String(seq).padStart(3, "0")}/SPH/${offerInitials()}`,
+      sifat: "Segera",
+      lampiran: "1 (satu) Dokumen",
+      perihal: "Penawaran Harga",
+      place: cityFromAddress(settings.business_address),
+      date: todayWib(),
+      recipientTitle: "Bapak/Ibu Pimpinan",
+      recipientName: job.customer_name || customer.name || "",
+      recipientAddress: customer.address || "",
+      intro: `Bersama dengan ini kami ${businessName} mengajukan penawaran harga kepada Bapak/Ibu Pimpinan, terkait layanan ${serviceList || "jasa kami"}. Kami siap dan berkomitmen untuk melayani kebutuhan Anda dengan cepat, bersih, dan profesional. Adapun besaran tarif layanan kami sebagai berikut:`,
+      rows,
+      notes: "",
+      closing: `Demikian penawaran harga ini kami sampaikan, besar harapan kami untuk dapat bekerjasama dan siap melayani kebutuhan Bapak/Ibu. Untuk pemesanan dan informasi lebih lanjut, silakan hubungi kami di Telp/WA ${phone}${website ? ` atau kunjungi ${website}` : ""}. Kami ucapkan terimakasih.`,
+      signer: "",
+    });
+  };
+
+  const buildOfferDoc = async (form) => {
+    const { jsPDF } = await import("jspdf");
+    const doc = new jsPDF();
+    const businessName = settings.business_name || "Pencatat Laporan";
+    let y = 18;
+    let textX = 14;
+    let logoBottom = 0;
+    if (settings.business_logo) {
+      try {
+        const props = doc.getImageProperties(settings.business_logo);
+        const format = settings.business_logo.includes("image/jpeg") ? "JPEG" : "PNG";
+        const aspect = props.width / props.height;
+        const logoW = aspect >= 1 ? 28 : Math.min(28, 20 * aspect);
+        const logoH = aspect >= 1 ? 28 / aspect : 20;
+        doc.addImage(settings.business_logo, format, 14, 12, logoW, logoH);
+        textX = 14 + logoW + 4;
+        logoBottom = 12 + logoH;
+      } catch { /* logo rusak: lanjut tanpa logo */ }
+    }
+    doc.setFontSize(18); doc.setFont("helvetica", "bold");
+    doc.splitTextToSize(businessName.toUpperCase(), 196 - textX).forEach((l) => { doc.text(l, textX, y); y += 8; });
+    doc.setFontSize(11); doc.setFont("helvetica", "normal");
+    const businessLines = [settings.business_address, [settings.business_phone, settings.business_website].filter(Boolean).join(" · ")].filter(Boolean);
+    businessLines.forEach((line) => { doc.splitTextToSize(String(line), 196 - textX).forEach((l) => { doc.text(l, textX, y); y += 6; }); });
+    y = Math.max(y, logoBottom) + 4;
+    doc.setDrawColor(230, 0, 18); doc.setLineWidth(0.8); doc.line(14, y, 196, y); y += 10;
+    doc.setFontSize(11);
+    [["Nomor", form.number], ["Sifat", form.sifat], ["Lampiran", form.lampiran], ["Perihal", form.perihal]].forEach(([label, value]) => {
+      doc.setFont("helvetica", "normal"); doc.text(label, 14, y);
+      doc.text(":", 44, y);
+      doc.setFont("helvetica", "bold"); doc.text(String(value || "-"), 48, y); y += 6;
+    });
+    y += 4;
+    doc.setFont("helvetica", "normal");
+    doc.text("Kepada Yth.", 14, y); y += 6;
+    doc.setFont("helvetica", "bold");
+    if (form.recipientTitle) doc.splitTextToSize(form.recipientTitle, 182).forEach((l) => { doc.text(l, 14, y); y += 6; });
+    if (form.recipientName) doc.splitTextToSize(form.recipientName, 182).forEach((l) => { doc.text(l, 14, y); y += 6; });
+    doc.setFont("helvetica", "normal");
+    if (form.recipientAddress) doc.splitTextToSize(form.recipientAddress, 182).forEach((l) => { doc.text(l, 14, y); y += 6; });
+    y += 4;
+    const placeDate = [form.place, formatDateId(form.date)].filter(Boolean).join(", ");
+    if (placeDate) { doc.text(placeDate, 196, y, { align: "right" }); y += 8; }
+    if (form.intro) doc.splitTextToSize(form.intro, 182).forEach((line) => { doc.text(line, 14, y); y += 6; });
+    y += 4;
+    const rows = form.rows.filter((r) => r.checked);
+    doc.setFont("helvetica", "bold");
+    doc.text("No", 14, y); doc.text("Jenis Pelayanan", 24, y); doc.text("Tarif", 196, y, { align: "right" }); y += 7;
+    doc.setDrawColor(200, 200, 200); doc.setLineWidth(0.4); doc.line(14, y, 196, y); y += 8;
+    doc.setFont("helvetica", "normal");
+    rows.forEach((r, i) => {
+      const lines = doc.splitTextToSize(r.service_type || "-", 100);
+      doc.text(`${i + 1}.`, 14, y);
+      doc.text(`${fmtRp(r.unit_price)} / ${r.unit || "paket"}`, 196, y, { align: "right" });
+      lines.forEach((line) => { doc.text(line, 24, y); y += 6; });
+      y += 2;
+    });
+    y += 2;
+    if (form.notes) {
+      doc.setFontSize(10);
+      doc.splitTextToSize(`Ket: ${form.notes}`, 182).forEach((line) => { doc.text(line, 14, y); y += 5; });
+      doc.setFontSize(11); y += 4;
+    }
+    if (form.closing) doc.splitTextToSize(form.closing, 182).forEach((line) => { doc.text(line, 14, y); y += 6; });
+    y += 8;
+    doc.setFont("helvetica", "bold");
+    doc.text("Penanggung Jawab", 140, y); y += 6;
+    doc.text(businessName, 140, y); y += 14;
+    doc.setFont("helvetica", "normal");
+    doc.text("(............................................)", 140, y); y += 6;
+    if (form.signer) doc.text(form.signer, 140, y);
+    doc.setFontSize(10);
+    doc.text("Surat penawaran ini dibuat dari aplikasi Pencatat Laporan.", 14, 285);
+    return doc;
+  };
+
+  const offerFilename = (form) => `penawaran-harga-${String(form.number || "penawaran").replace(/[^A-Za-z0-9]+/g, "-")}.pdf`;
+
+  const downloadOffer = async () => {
+    if (!offerForm) return;
+    try {
+      const doc = await buildOfferDoc(offerForm);
+      doc.save(offerFilename(offerForm));
+      bumpOfferSeq();
+    } catch (err) { setError(`Gagal membuat surat penawaran: ${err.message}`); }
+  };
+
+  const sendOfferWhatsApp = async () => {
+    if (!offerForm) return;
+    const customer = customers.find((c) => c.id === Number(offerJob?.customer_id)) || {};
+    const phone = toWaNumber(customer.phone || offerJob?.customer_phone);
+    const rows = offerForm.rows.filter((r) => r.checked);
+    const msg = [
+      `${settings.business_name || "Pencatat Laporan"}`,
+      `Surat Penawaran Harga ${offerForm.number}`,
+      `Kepada: ${offerForm.recipientName || "-"}`,
+      "",
+      ...rows.map((r) => `- ${r.service_type}: ${fmtRp(r.unit_price)} / ${r.unit || "paket"}`),
+      settings.business_phone ? `\nInfo: ${settings.business_phone}` : "",
+    ].filter((l) => l !== "").join("\n");
+    try {
+      const doc = await buildOfferDoc(offerForm);
+      const file = new File([doc.output("blob")], offerFilename(offerForm), { type: "application/pdf" });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: `Penawaran Harga ${offerForm.number}`, text: `${settings.business_name || "Pencatat Laporan"} — Penawaran Harga ${offerForm.number}.` });
+        bumpOfferSeq();
+        return;
+      }
+    } catch (err) {
+      if (err?.name === "AbortError") return;
+    }
+    if (!/^62\d{8,13}$/.test(phone)) {
+      setError("Berbagi file PDF tidak didukung browser ini, dan nomor WA pelanggan belum diisi atau tidak valid. Lengkapi dulu di data pelanggan, atau unduh PDF-nya lalu kirim manual dari WhatsApp.");
+      return;
+    }
+    window.open(`https://wa.me/${phone}?text=${encodeURIComponent(msg)}`, "_blank", "noopener");
+    bumpOfferSeq();
+  };
+
+  const previewOffer = () => { if (offerForm) setOfferPreview({ ...offerForm, rows: offerForm.rows.map((r) => ({ ...r })) }); };
+  const closeOfferPreview = () => { setOfferPreview(null); };
 
   const markJobPaid = async (job, after) => {
     const remaining = remainingOf(job);
@@ -993,36 +1321,56 @@ export default function Home() {
               <p className="text-zinc-400 -mt-1">Silakan masuk untuk melanjutkan.</p>
             </div>
             <div className="bg-panel border border-line rounded-[28px] p-6 mt-6 shadow-xl">
-              <form onSubmit={handleLogin} className="space-y-4">
-                <div className="relative">
-                  <span className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-400 pointer-events-none">
-                    {fieldIcon(<><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" /></>)}
-                  </span>
-                  <input className="login-input pl-11" name="username" autoComplete="username" required
-                    placeholder="Username" aria-label="Username"
-                    value={loginForm.username} onChange={(e) => setLoginForm({ ...loginForm, username: e.target.value })} />
-                </div>
-                <div className="relative">
-                  <span className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-400 pointer-events-none">
-                    {fieldIcon(<><rect x="3" y="11" width="18" height="11" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" /></>)}
-                  </span>
-                  <input className="login-input pl-11 pr-11" type={showPassword ? "text" : "password"}
-                    autoComplete="current-password" required placeholder="Password" aria-label="Password"
-                    value={loginForm.password} onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })} />
-                  <button type="button" onClick={() => setShowPassword(!showPassword)}
-                    aria-label={showPassword ? "Sembunyikan password" : "Tampilkan password"}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-persona p-1">
-                    {showPassword
-                      ? fieldIcon(<><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 6.06-5.94" /><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19" /><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24" /><line x1="1" y1="1" x2="23" y2="23" /></>)
-                      : fieldIcon(<><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" /><circle cx="12" cy="12" r="3" /></>)}
-                  </button>
-                </div>
-                {loginError && <p className="text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg p-3 text-sm">{loginError}</p>}
-                <button type="submit" className="w-full bg-persona hover:bg-persona-dark text-white font-bold py-3.5 rounded-full">Masuk</button>
-              </form>
-              <p className="text-zinc-400 text-xs text-center mt-4">Akun diatur lewat environment variable di Cloudflare, bukan dari database.</p>
+              {typeof window !== "undefined" && new URLSearchParams(window.location.search).get("auth_error") && (
+                <p className="text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg p-3 text-sm mb-4">{new URLSearchParams(window.location.search).get("auth_error")}</p>
+              )}
+              <a href="/api/auth/google" className="w-full bg-white text-black font-bold py-4 rounded-full flex items-center justify-center gap-2 text-base shadow transition-transform duration-150 active:scale-[0.97]">
+                <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="#4285F4" d="M23.49 12.27c0-.79-.07-1.54-.19-2.27H12v4.51h6.47a5.53 5.53 0 0 1-2.4 3.58v3h3.86c2.26-2.09 3.56-5.17 3.56-8.82z" /><path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.86-3c-1.08.72-2.45 1.16-4.07 1.16-3.13 0-5.78-2.11-6.73-4.96H1.29v3.09A12 12 0 0 0 12 24z" /><path fill="#FBBC05" d="M5.27 14.29A7.2 7.2 0 0 1 4.89 12c0-.8.14-1.57.38-2.29V6.62H1.29a12 12 0 0 0 0 10.76l3.98-3.09z" /><path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42A11.98 11.98 0 0 0 12 0 12 12 0 0 0 1.29 6.62l3.98 3.09C6.22 6.86 8.87 4.75 12 4.75z" /></svg>
+                Login dengan Google
+              </a>
+              <p className="text-zinc-400 text-xs text-center mt-4">Dengan masuk, kamu menyetujui <a href="/syarat/" className="text-zinc-300 font-medium underline underline-offset-2">Syarat Layanan</a> dan <a href="/privasi/" className="text-zinc-300 font-medium underline underline-offset-2">Kebijakan Privasi</a> Pencatat Laporan.</p>
             </div>
-            <p className="text-zinc-400 text-xs text-center mt-4">Pencatat Laporan — Pencatat Pelanggan Jasa</p>
+            <div className="text-center mt-6 space-y-1">
+              <p className="text-zinc-400 text-xs">Catat pelanggan, pantau pemasukan, dan kirim tagihan — semua dalam satu tempat.</p>
+              <p className="text-zinc-400 text-xs">Pencatat Laporan — Pencatat Pelanggan Jasa</p>
+              <p className="text-zinc-500 text-[11px]">© 2026 Pencatat Laporan</p>
+            </div>
+          </div>
+        </div>
+      </main>
+    );
+  }
+
+  if (view === "onboarding") {
+    return (
+      <main className="min-h-screen flex flex-col px-4 pb-16">
+        <div className="flex-1 flex items-center justify-center">
+          <div className="w-full max-w-sm">
+            <div className="flex flex-col items-center text-center gap-3">
+              <AppLogo size={96} theme={theme} />
+              <h1 className="font-bold text-3xl tracking-tight">Buat profil usaha</h1>
+              <p className="text-zinc-400 -mt-1">Akun Google kamu sudah terhubung. Isi nama usahamu untuk mulai mencatat pelanggan dan transaksi.</p>
+            </div>
+            <div className="bg-panel border border-line rounded-[28px] p-6 mt-6 shadow-xl">
+              <form onSubmit={submitBusiness} className="space-y-4">
+                <div>
+                  <label className="font-bold text-sm">Nama usaha *</label>
+                  <input className="mt-1" required placeholder="cth: Jasa Sedot WC Andro"
+                    value={businessForm.business_name} onChange={(e) => setBusinessForm({ ...businessForm, business_name: e.target.value })} />
+                </div>
+                <div>
+                  <label className="font-bold text-sm">Alamat</label>
+                  <input className="mt-1" value={businessForm.business_address} onChange={(e) => setBusinessForm({ ...businessForm, business_address: e.target.value })} />
+                </div>
+                <div>
+                  <label className="font-bold text-sm">No. telepon / WhatsApp</label>
+                  <input className="mt-1" inputMode="tel" value={businessForm.business_phone} onChange={(e) => setBusinessForm({ ...businessForm, business_phone: e.target.value })} />
+                </div>
+                {businessError && <p className="text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg p-3 text-sm">{businessError}</p>}
+                <button type="submit" className="w-full bg-persona hover:bg-persona-dark text-white font-bold py-3.5 rounded-full">Buat usaha</button>
+              </form>
+              <button type="button" onClick={handleLogout} className="w-full text-center text-sm text-zinc-400 mt-4">Keluar</button>
+            </div>
           </div>
         </div>
       </main>
@@ -1072,6 +1420,17 @@ export default function Home() {
               <button aria-label="Tutup menu profil" onClick={() => { setInstallHelp(false); setShowProfileMenu(false); }} className="fixed inset-0 z-40 cursor-default" />
               <div className="absolute right-0 top-full mt-2 w-56 bg-panel border border-line rounded-2xl shadow-2xl p-2 z-50">
                 <p className="text-xs text-zinc-400 px-3 py-2">Login sebagai {username}</p>
+                {activeBusiness && <p className="text-xs text-zinc-400 px-3 pb-1">Usaha: <span className="text-white font-bold">{activeBusiness.name}</span></p>}
+                {businesses.length > 1 && businesses.map((b) => (
+                  <button key={b.id} type="button" onClick={() => switchBusiness(b.id)} className="w-full text-left px-3 py-2.5 rounded-xl font-bold text-sm hover:bg-zinc-800">{b.id === activeBusiness?.id ? "✓ " : ""}{b.name}</button>
+                ))}
+                {businesses.length > 1 && <div className="border-t border-line my-1" />}
+                {authKind === "google" && (
+                  <button type="button" onClick={() => { setShowProfileMenu(false); setBusinessForm({ business_name: "", business_address: "", business_phone: "", business_website: "", bank_name: "", bank_account_number: "", bank_account_holder: "" }); setBusinessError(""); setShowBusinessModal(true); }} className="w-full text-left px-3 py-2.5 rounded-xl font-bold text-sm hover:bg-zinc-800">+ Tambah usaha</button>
+                )}
+                {authKind === "password" && (
+                  <a href="/api/auth/google?mode=link" className="block w-full text-left px-3 py-2.5 rounded-xl font-bold text-sm hover:bg-zinc-800">Hubungkan akun Google</a>
+                )}
                 <button type="button" onClick={() => { setShowProfileMenu(false); openSettings("profil"); }} className="w-full text-left px-3 py-2.5 rounded-xl font-bold text-sm hover:bg-zinc-800">Profil</button>
                 <button type="button" onClick={() => { setShowProfileMenu(false); openSettings("pengaturan"); }} className="w-full text-left px-3 py-2.5 rounded-xl font-bold text-sm hover:bg-zinc-800">Pengaturan</button>
                 <div className="border-t border-line my-1" />
@@ -1814,6 +2173,14 @@ export default function Home() {
               <button onClick={() => markJobPaid(detailJob)} className="w-full bg-zinc-800 px-5 py-3 rounded-xl font-bold text-sm">Tandai lunas (sisa {fmtRp(remainingOf(detailJob))})</button>
             )}
             <button onClick={() => { const j = detailJob; setDetailJob(null); duplicateJob(j); }} className="w-full bg-zinc-800 px-5 py-3 rounded-xl font-bold text-sm">Ulangi transaksi</button>
+            <button onClick={() => previewInvoice(detailJob)} className="w-full bg-zinc-800 px-5 py-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" /><circle cx="12" cy="12" r="3" /></svg>
+              Preview Invoice
+            </button>
+            <button onClick={() => openOfferForm(detailJob)} className="w-full bg-zinc-800 px-5 py-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2">
+              <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /><path d="M9 13h6M9 17h6" /></svg>
+              Buat Surat Penawaran Harga
+            </button>
             <div className="grid grid-cols-3 gap-2">
               <button onClick={() => downloadInvoice(detailJob)} aria-label="Unduh Invoice (PDF)" title="Unduh Invoice (PDF)" className="bg-zinc-800 h-12 rounded-xl flex items-center justify-center">
                 <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><path d="M7 10l5 5 5-5" /><path d="M12 15V3" /></svg>
@@ -1828,6 +2195,264 @@ export default function Home() {
           </div>
           <p className="text-xs text-zinc-400 mt-3">Kirim via WhatsApp membagikan file PDF invoice langsung (di HP Android, pilih WhatsApp di lembar berbagi lalu pilih kontak pelanggan). Bila browser tidak mendukung berbagi file, tombol ini membuka chat wa.me ke nomor WA pelanggan dengan pesan teks invoice — wa.me tidak bisa melampirkan file, jadi dalam kasus itu unduh dulu PDF-nya lalu lampirkan manual.</p>
           <p className="text-xs text-zinc-400 mt-3">Header invoice memakai informasi usaha dari Pengaturan (tombol profil di atas). Isi dulu di sana bila nama/alamat/telepon/website usaha belum tampil di invoice.</p>
+        </Modal>
+      )}
+
+      {invoicePreview && (() => {
+        const job = invoicePreview.job;
+        const customer = customers.find((c) => c.id === Number(job.customer_id)) || {};
+        const statusLabel = job.status === "lunas" ? "Lunas" : job.status === "dp" ? "DP" : "Belum bayar";
+        const invNo = `INV-${String(job.job_date).replaceAll("-", "")}-${String(job.id).padStart(4, "0")}`;
+        const invItems = job.items?.length
+          ? job.items
+          : [{ service_type: job.service_type, qty: 1, unit: "paket", unit_price: job.amount, amount: job.amount }];
+        const paid = Number(job.paid_amount || 0);
+        const remaining = Math.max(0, Number(job.amount) - paid);
+        const isLunas = job.status === "lunas";
+        return (
+        <Modal title="Preview Invoice" onClose={closeInvoicePreview}>
+          <div className="relative bg-white text-black rounded-xl overflow-hidden border border-line text-sm">
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-20">
+              <span className={`font-bold tracking-wide whitespace-nowrap select-none ${isLunas ? "text-[#e60012]/15 text-4xl" : "text-zinc-400/30 text-3xl"}`}>{isLunas ? "LUNAS" : "BELUM LUNAS"}</span>
+            </div>
+            <div className="relative z-10 p-4">
+              <div className="flex gap-3 items-start">
+                {settings.business_logo && <img src={settings.business_logo} alt="" className="w-14 h-14 object-contain shrink-0" />}
+                <div className="min-w-0">
+                  <p className="font-bold text-base leading-tight">{settings.business_name || "Pencatat Laporan"}</p>
+                  {settings.business_address && <p className="text-xs text-zinc-600">{settings.business_address}</p>}
+                  {settings.business_phone && <p className="text-xs text-zinc-600">{settings.business_phone}</p>}
+                  {settings.business_website && <p className="text-xs text-zinc-600">{settings.business_website}</p>}
+                </div>
+              </div>
+              <div className="border-t-2 border-[#e60012] my-3" />
+              <p className="font-bold text-base">INVOICE</p>
+              <p className="text-xs mt-1">Nomor: {invNo}</p>
+              <p className="text-xs">Tanggal: {job.job_date}</p>
+              <p className="text-xs">Status: {statusLabel}</p>
+              <p className="font-bold text-xs mt-3">Ditagihkan kepada:</p>
+              <p className="text-xs">{job.customer_name || customer.name || ""}{customer.phone ? ` (${customer.phone})` : job.customer_phone ? ` (${job.customer_phone})` : ""}</p>
+              {customer.address && <p className="text-xs">{customer.address}</p>}
+              <table className="w-full text-xs mt-3">
+                <thead><tr className="border-b border-zinc-300 text-left"><th className="py-1 pr-2">Layanan</th><th className="py-1 pr-2">Jumlah</th><th className="py-1 pr-2">Harga satuan</th><th className="py-1 text-right">Subtotal</th></tr></thead>
+                <tbody>
+                  {invItems.map((it, i) => (
+                    <tr key={i} className="border-b border-zinc-200 align-top"><td className="py-1.5 pr-2">{it.service_type}</td><td className="py-1.5 pr-2 whitespace-nowrap">{fmtQty(it.qty)} {it.unit || ""}</td><td className="py-1.5 pr-2 whitespace-nowrap">{fmtRp(it.unit_price)}</td><td className="py-1.5 text-right whitespace-nowrap">{fmtRp(it.amount)}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="flex justify-between font-bold mt-3"><span>Total</span><span>{fmtRp(job.amount)}</span></div>
+              {paid > 0 && <p className="text-xs mt-2">Sudah dibayar: {fmtRp(paid)}</p>}
+              {remaining > 0 && <p className="text-xs font-bold">Sisa tagihan: {fmtRp(remaining)}</p>}
+              {job.note && <p className="text-xs mt-2">Catatan: {job.note}</p>}
+              {settings.bank_name && settings.bank_account_number && <p className="text-xs font-bold mt-2">Pembayaran via transfer: {settings.bank_name} {settings.bank_account_number}{settings.bank_account_holder ? ` a.n. ${settings.bank_account_holder}` : ""}</p>}
+              <p className="text-[11px] text-zinc-500 mt-3">Invoice ini dibuat dari aplikasi Pencatat Laporan.</p>
+            </div>
+          </div>
+          <div className="mt-4 space-y-2">
+            <button onClick={() => openPdfViewer(invoicePreview.job)} className="w-full bg-zinc-800 px-5 py-3 rounded-xl font-bold text-sm">Buka di PDF viewer</button>
+            <button onClick={() => downloadInvoice(invoicePreview.job)} className="w-full bg-zinc-800 px-5 py-3 rounded-xl font-bold text-sm">Unduh PDF</button>
+            <button onClick={() => { const j = invoicePreview.job; closeInvoicePreview(); sendInvoiceWhatsApp(j); }} className="w-full bg-[#25d366] hover:opacity-90 px-5 py-3 rounded-xl font-bold text-sm text-white">Kirim via WhatsApp</button>
+            <button onClick={closeInvoicePreview} className="w-full bg-zinc-800 px-5 py-3 rounded-xl font-bold text-sm">Tutup preview</button>
+          </div>
+        </Modal>
+        );
+      })()}
+
+      {offerForm && (
+        <Modal title="Surat Penawaran Harga" onClose={() => setOfferForm(null)}>
+          <div className="space-y-4 text-sm">
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="font-bold text-sm">Nomor</label>
+                <input className="mt-1" value={offerForm.number} onChange={(e) => setOfferForm({ ...offerForm, number: e.target.value })} />
+              </div>
+              <div>
+                <label className="font-bold text-sm">Sifat</label>
+                <input className="mt-1" value={offerForm.sifat} onChange={(e) => setOfferForm({ ...offerForm, sifat: e.target.value })} />
+              </div>
+              <div>
+                <label className="font-bold text-sm">Lampiran</label>
+                <input className="mt-1" value={offerForm.lampiran} onChange={(e) => setOfferForm({ ...offerForm, lampiran: e.target.value })} />
+              </div>
+              <div>
+                <label className="font-bold text-sm">Perihal</label>
+                <input className="mt-1" value={offerForm.perihal} onChange={(e) => setOfferForm({ ...offerForm, perihal: e.target.value })} />
+              </div>
+              <div>
+                <label className="font-bold text-sm">Tempat</label>
+                <input className="mt-1" value={offerForm.place} onChange={(e) => setOfferForm({ ...offerForm, place: e.target.value })} placeholder="Kota" />
+              </div>
+              <div>
+                <label className="font-bold text-sm">Tanggal</label>
+                <input type="date" className="mt-1" value={offerForm.date} onChange={(e) => setOfferForm({ ...offerForm, date: e.target.value })} />
+              </div>
+            </div>
+            <div>
+              <label className="font-bold text-sm">Kepada Yth.</label>
+              <input className="mt-1" value={offerForm.recipientTitle} onChange={(e) => setOfferForm({ ...offerForm, recipientTitle: e.target.value })} />
+              <input className="mt-2" value={offerForm.recipientName} onChange={(e) => setOfferForm({ ...offerForm, recipientName: e.target.value })} placeholder="Nama penerima / perusahaan" />
+              <input className="mt-2" value={offerForm.recipientAddress} onChange={(e) => setOfferForm({ ...offerForm, recipientAddress: e.target.value })} placeholder="Alamat penerima (opsional)" />
+            </div>
+            <div>
+              <div className="flex justify-between items-center gap-2">
+                <label className="font-bold text-sm">Pembuka surat</label>
+                <button type="button" onClick={() => setOfferEditField({ key: "intro", label: "Pembuka surat" })} className="bg-zinc-800 px-3 py-1.5 rounded-lg text-xs font-bold shrink-0">⤢ Perbesar</button>
+              </div>
+              <textarea className="mt-1" rows={7} style={{ minHeight: "168px" }} value={offerForm.intro} onChange={(e) => setOfferForm({ ...offerForm, intro: e.target.value })} />
+            </div>
+            <div>
+              <p className="font-bold text-sm mb-2">Tarif layanan <span className="text-zinc-400 font-normal">— dari daftar harga jasa usaha ini</span></p>
+              <div className="space-y-2">
+                {offerForm.rows.map((r, i) => (
+                  <div key={i} className="border border-line rounded-xl p-3 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <input type="checkbox" className="w-4 h-4 accent-[#e60012] shrink-0" style={{ width: "auto" }} checked={r.checked} onChange={(e) => setOfferForm({ ...offerForm, rows: offerForm.rows.map((x, j) => j === i ? { ...x, checked: e.target.checked } : x) })} aria-label="Sertakan layanan ini" />
+                      <input value={r.service_type} onChange={(e) => setOfferForm({ ...offerForm, rows: offerForm.rows.map((x, j) => j === i ? { ...x, service_type: e.target.value } : x) })} placeholder="Nama layanan" className="flex-1 min-w-0" />
+                      <button type="button" onClick={() => setOfferForm({ ...offerForm, rows: offerForm.rows.filter((_, j) => j !== i) })} aria-label="Hapus layanan" className="bg-zinc-800 w-8 h-8 rounded-lg font-bold shrink-0">×</button>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2 pl-6">
+                      <div>
+                        <label className="text-xs text-zinc-400">Tarif (Rp)</label>
+                        <input inputMode="numeric" value={r.unit_price} onChange={(e) => setOfferForm({ ...offerForm, rows: offerForm.rows.map((x, j) => j === i ? { ...x, unit_price: e.target.value.replace(/\D/g, "") } : x) })} />
+                      </div>
+                      <div>
+                        <label className="text-xs text-zinc-400">Satuan</label>
+                        <input value={r.unit} onChange={(e) => setOfferForm({ ...offerForm, rows: offerForm.rows.map((x, j) => j === i ? { ...x, unit: e.target.value } : x) })} placeholder="cth: meter kubik" />
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <button type="button" onClick={() => setOfferForm({ ...offerForm, rows: [...offerForm.rows, { service_type: "", unit: "paket", unit_price: 0, checked: true }] })} className="mt-2 bg-zinc-800 px-4 py-2.5 rounded-xl font-bold text-sm">+ Tambah layanan</button>
+            </div>
+            <div>
+              <div className="flex justify-between items-center gap-2">
+                <label className="font-bold text-sm">Keterangan (Ket)</label>
+                <button type="button" onClick={() => setOfferEditField({ key: "notes", label: "Keterangan (Ket)" })} className="bg-zinc-800 px-3 py-1.5 rounded-lg text-xs font-bold shrink-0">⤢ Perbesar</button>
+              </div>
+              <textarea className="mt-1" rows={3} value={offerForm.notes} onChange={(e) => setOfferForm({ ...offerForm, notes: e.target.value })} placeholder="cth: Lumpur Tinja: berasal dari toilet/wc; Lumpur Domestik: berasal dari toilet/wc, cuci tangan, dapur, dll (non-B3)" />
+            </div>
+            <div>
+              <div className="flex justify-between items-center gap-2">
+                <label className="font-bold text-sm">Penutup surat</label>
+                <button type="button" onClick={() => setOfferEditField({ key: "closing", label: "Penutup surat" })} className="bg-zinc-800 px-3 py-1.5 rounded-lg text-xs font-bold shrink-0">⤢ Perbesar</button>
+              </div>
+              <textarea className="mt-1" rows={6} style={{ minHeight: "144px" }} value={offerForm.closing} onChange={(e) => setOfferForm({ ...offerForm, closing: e.target.value })} />
+            </div>
+            <div>
+              <label className="font-bold text-sm">Nama penandatangan <span className="text-zinc-400 font-normal">(opsional)</span></label>
+              <input className="mt-1" value={offerForm.signer} onChange={(e) => setOfferForm({ ...offerForm, signer: e.target.value })} placeholder="Dibiarkan kosong bila belum ada" />
+            </div>
+          </div>
+          <div className="mt-5 space-y-2">
+            <button onClick={sendOfferWhatsApp} className="w-full bg-[#25d366] hover:opacity-90 px-5 py-3.5 rounded-xl font-bold text-white text-base flex items-center justify-center gap-2 shadow">Kirim via WhatsApp</button>
+            <div className="grid grid-cols-2 gap-2">
+              <button onClick={previewOffer} className="bg-zinc-800 px-5 py-3 rounded-xl font-bold text-sm">Preview</button>
+              <button onClick={downloadOffer} className="bg-zinc-800 px-5 py-3 rounded-xl font-bold text-sm">Unduh PDF</button>
+            </div>
+          </div>
+          <p className="text-xs text-zinc-400 mt-3">Kop surat dan tarif mengikuti profil usaha aktif dan daftar harga jasa (Pengaturan). Nomor surat otomatis berurutan per usaha. Kirim via WhatsApp membagikan file PDF langsung lewat lembar berbagi perangkat; bila tidak didukung, dibuka chat wa.me ke nomor pelanggan dengan ringkasan tarif.</p>
+        </Modal>
+      )}
+
+      {offerEditField && offerForm && (
+        <div className="fixed inset-0 z-[70] bg-panel flex flex-col" role="dialog" aria-modal="true" aria-label={offerEditField.label}>
+          <div className="flex justify-between items-center gap-3 p-4 border-b border-line shrink-0">
+            <h2 className="font-bold text-lg">{offerEditField.label}</h2>
+            <button onClick={() => setOfferEditField(null)} aria-label="Tutup editor" className="bg-zinc-800 w-9 h-9 rounded-full font-bold shrink-0">×</button>
+          </div>
+          <div className="flex-1 min-h-0 p-4">
+            <textarea
+              className="w-full h-full"
+              style={{ resize: "none" }}
+              value={offerForm[offerEditField.key]}
+              onChange={(e) => setOfferForm({ ...offerForm, [offerEditField.key]: e.target.value })}
+              autoFocus
+            />
+          </div>
+          <div className="p-4 pt-0 shrink-0">
+            <button onClick={() => setOfferEditField(null)} className="w-full bg-persona hover:bg-persona-dark text-white font-bold py-3.5 rounded-full">Selesai</button>
+          </div>
+        </div>
+      )}
+
+      {offerPreview && (() => {
+        const form = offerPreview;
+        const businessName = settings.business_name || "Pencatat Laporan";
+        const rows = form.rows.filter((r) => r.checked);
+        const placeDate = [form.place, formatDateId(form.date)].filter(Boolean).join(", ");
+        return (
+        <Modal title="Preview Surat Penawaran" onClose={closeOfferPreview}>
+          <div className="relative bg-white text-black rounded-xl overflow-hidden border border-line text-sm">
+            <div className="relative z-10 p-4">
+              <div className="flex gap-3 items-start">
+                {settings.business_logo && <img src={settings.business_logo} alt="" className="w-14 h-14 object-contain shrink-0" />}
+                <div className="min-w-0">
+                  <p className="font-bold text-base leading-tight uppercase">{businessName}</p>
+                  {settings.business_address && <p className="text-xs text-zinc-600">{settings.business_address}</p>}
+                  {(settings.business_phone || settings.business_website) && <p className="text-xs text-zinc-600">{[settings.business_phone, settings.business_website].filter(Boolean).join(" · ")}</p>}
+                </div>
+              </div>
+              <div className="border-t-2 border-[#e60012] my-3" />
+              <div className="text-xs space-y-0.5">
+                <p><span className="inline-block w-20">Nomor</span>: <strong>{form.number}</strong></p>
+                <p><span className="inline-block w-20">Sifat</span>: {form.sifat}</p>
+                <p><span className="inline-block w-20">Lampiran</span>: {form.lampiran}</p>
+                <p><span className="inline-block w-20">Perihal</span>: <strong>{form.perihal}</strong></p>
+              </div>
+              <p className="text-xs mt-3">Kepada Yth.</p>
+              <p className="text-xs font-bold">{form.recipientTitle}</p>
+              {form.recipientName && <p className="text-xs font-bold">{form.recipientName}</p>}
+              {form.recipientAddress && <p className="text-xs">{form.recipientAddress}</p>}
+              {placeDate && <p className="text-xs text-right mt-3">{placeDate}</p>}
+              {form.intro && <p className="text-xs leading-relaxed mt-3 text-justify">{form.intro}</p>}
+              <table className="w-full text-xs mt-3">
+                <thead><tr className="border-b border-zinc-300 text-left"><th className="py-1.5 pr-2 w-8">No</th><th className="py-1.5 pr-2">Jenis Pelayanan</th><th className="py-1.5 text-right">Tarif</th></tr></thead>
+                <tbody>
+                  {rows.map((r, i) => (
+                    <tr key={i} className="border-b border-zinc-200 align-top"><td className="py-1.5 pr-2">{i + 1}.</td><td className="py-1.5 pr-2">{r.service_type}</td><td className="py-1.5 text-right whitespace-nowrap">{fmtRp(r.unit_price)} / {r.unit || "paket"}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+              {form.notes && <p className="text-xs leading-relaxed mt-3">Ket: {form.notes}</p>}
+              {form.closing && <p className="text-xs leading-relaxed mt-3 text-justify">{form.closing}</p>}
+              <div className="mt-6 ml-auto w-44 text-xs">
+                <p className="font-bold">Penanggung Jawab</p>
+                <p className="font-bold">{businessName}</p>
+                <p className="mt-8">(............................................)</p>
+                {form.signer && <p>{form.signer}</p>}
+              </div>
+              <p className="text-[11px] text-zinc-500 mt-6">Surat penawaran ini dibuat dari aplikasi Pencatat Laporan.</p>
+            </div>
+          </div>
+          <div className="mt-4 grid grid-cols-2 gap-2">
+            <button onClick={downloadOffer} className="bg-zinc-800 px-5 py-3 rounded-xl font-bold text-sm">Unduh PDF</button>
+            <button onClick={sendOfferWhatsApp} className="bg-[#25d366] hover:opacity-90 px-5 py-3 rounded-xl font-bold text-white text-sm">Kirim via WhatsApp</button>
+          </div>
+        </Modal>
+        );
+      })()}
+
+      {showBusinessModal && (
+        <Modal title="Tambah usaha" onClose={() => setShowBusinessModal(false)}>
+          <form onSubmit={submitBusiness} className="space-y-4">
+            <div>
+              <label className="font-bold text-sm">Nama usaha *</label>
+              <input className="mt-1" required placeholder="cth: Jasa Sedot WC Andro"
+                value={businessForm.business_name} onChange={(e) => setBusinessForm({ ...businessForm, business_name: e.target.value })} />
+            </div>
+            <div>
+              <label className="font-bold text-sm">Alamat</label>
+              <input className="mt-1" value={businessForm.business_address} onChange={(e) => setBusinessForm({ ...businessForm, business_address: e.target.value })} />
+            </div>
+            <div>
+              <label className="font-bold text-sm">No. telepon / WhatsApp</label>
+              <input className="mt-1" inputMode="tel" value={businessForm.business_phone} onChange={(e) => setBusinessForm({ ...businessForm, business_phone: e.target.value })} />
+            </div>
+            {businessError && <p className="text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg p-3 text-sm">{businessError}</p>}
+            <button type="submit" className="w-full bg-persona hover:bg-persona-dark text-white font-bold py-3.5 rounded-full">Buat usaha</button>
+          </form>
         </Modal>
       )}
 
