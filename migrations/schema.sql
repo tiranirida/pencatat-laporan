@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   status TEXT NOT NULL DEFAULT 'lunas' CHECK (status IN ('lunas', 'dp', 'belum')),
   job_date TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT '',
+  payment_method TEXT NOT NULL DEFAULT 'transfer',
+  bank_text TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

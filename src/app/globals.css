@@ -2,6 +2,63 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Skema warna: aksen 600 + gelap 700 + terang 500 + tint, satu garis shade
+   yang sama untuk semua skema supaya tetap kalem, tidak mencolok. */
+:root {
+  --accent: #0284C7;
+  --accent-dark: #0369A1;
+  --accent-bright: #0EA5E9;
+  --accent-soft: rgba(14, 165, 233, 0.10);
+}
+html.theme-red {
+  --accent: #DC2626;
+  --accent-dark: #B91C1C;
+  --accent-bright: #EF4444;
+  --accent-soft: rgba(239, 68, 68, 0.10);
+}
+html.theme-green {
+  --accent: #16A34A;
+  --accent-dark: #15803D;
+  --accent-bright: #22C55E;
+  --accent-soft: rgba(34, 197, 94, 0.10);
+}
+html.theme-orange {
+  --accent: #EA580C;
+  --accent-dark: #C2410C;
+  --accent-bright: #F97316;
+  --accent-soft: rgba(249, 115, 22, 0.10);
+}
+/* Putih: aksen abu-abu netral (slate) — putih murni tidak bisa jadi aksen
+   karena tidak terlihat di atas permukaan putih. */
+html.theme-white {
+  --accent: #64748B;
+  --accent-dark: #475569;
+  --accent-bright: #94A3B8;
+  --accent-soft: rgba(148, 163, 184, 0.10);
+}
+/* Full Hitam: aksen hitam pekat; teks aksen di mode gelap memakai abu
+   terang supaya tetap terbaca di atas kartu gelap. */
+html.theme-black {
+  --accent: #171717;
+  --accent-dark: #000000;
+  --accent-bright: #D4D4D4;
+  --accent-soft: rgba(212, 212, 212, 0.10);
+}
+
+/* Utilitas aksen (mengikuti skema warna yang dipilih). Tombol aksen selalu
+   bertuliskan putih, di mode gelap maupun terang. */
+.bg-accent { background-color: var(--accent); color: #ffffff; }
+.bg-accent-dark { background-color: var(--accent-dark); }
+.text-accent { color: var(--accent-bright); }
+.theme-light .text-accent { color: var(--accent); }
+.border-accent { border-color: var(--accent); }
+.bg-accent-soft { background-color: var(--accent-soft); }
+.hover-bg-accent-dark:hover { background-color: var(--accent-dark); }
+.hover-text-accent:hover { color: var(--accent-bright); }
+.theme-light .hover-text-accent:hover { color: var(--accent); }
+.chart-label { fill: var(--accent-bright); }
+.theme-light .chart-label { fill: var(--accent); }
+
 body {
   background: #0a0a0a;
   color: #fafafa;
@@ -20,7 +77,7 @@ body {
   clip-path: polygon(0 0, 100% 0, calc(100% - 14px) 100%, 0 100%);
 }
 .p5-dots {
-  background-image: radial-gradient(#e60012 1px, transparent 1.5px);
+  background-image: radial-gradient(var(--accent) 1px, transparent 1.5px);
   background-size: 14px 14px;
 }
 input, select, textarea {
@@ -37,9 +94,9 @@ textarea {
   resize: vertical;
 }
 input:focus, select:focus, textarea:focus {
-  outline: 2px solid #e60012;
+  outline: 2px solid var(--accent);
   outline-offset: 1px;
-  border-color: #e60012;
+  border-color: var(--accent);
 }
 input[type="date"]::-webkit-calendar-picker-indicator,
 input[type="month"]::-webkit-calendar-picker-indicator {
@@ -60,6 +117,16 @@ input[type="month"]::-webkit-calendar-picker-indicator {
   background: #f4f5f7;
   color: #111827;
 }
+
+/* Lembar konten tab (Pelanggan/Transaksi/Piutang/Laporan): latar sama dengan
+   latar halaman, supaya hanya lengkung atasnya yang terlihat saat menimpa header. */
+.sheet-bg { background: #0a0a0a; }
+.theme-light .sheet-bg { background: #f4f5f7; }
+
+/* Angka kartu ringkasan: warna aksen di mode terang, putih di mode gelap
+   supaya kontras di atas kartu gelap. */
+.dash-num { color: #ffffff; }
+.theme-light .dash-num { color: var(--accent); }
 .theme-light .bg-panel {
   background: #ffffff;
 }
@@ -88,9 +155,19 @@ input[type="month"]::-webkit-calendar-picker-indicator {
   background: #d0d5dd;
 }
 
-/* Tombol merah selalu bertuliskan putih, di mode gelap maupun terang.
-   Sebelumnya tombol merah mewarisi warna teks body (putih di mode gelap,
-   hitam di mode terang) sehingga tulisannya jadi hitam di mode terang. */
-.bg-persona {
-  color: #ffffff;
+/* Kontras mode terang: teks abu-abu sekunder harus tetap terbaca di
+   atas kartu putih (zinc-400/500 mentah di atas putih di bawah 4,5:1). */
+.theme-light .text-zinc-400 {
+  color: #6b7280;
+}
+.theme-light .text-zinc-500 {
+  color: #6b7280;
+}
+
+/* Trek donat: gelap halus di mode gelap, abu muda di mode terang. */
+.donut-track {
+  color: #2a2a2a;
+}
+.theme-light .donut-track {
+  color: #e5e7eb;
 }

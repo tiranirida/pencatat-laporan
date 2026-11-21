@@ -127,9 +127,15 @@ async function ensureMultiTenant(env) {
   // per pernyataan supaya tidak menggagalkan yang lain.
   await Promise.all([
     qRun(env, "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, google_sub TEXT UNIQUE, email TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', picture TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL)"),
-    qRun(env, "CREATE TABLE IF NOT EXISTS businesses (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_user_id INTEGER, legacy INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL, address TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', website TEXT NOT NULL DEFAULT '', logo TEXT NOT NULL DEFAULT '', bank_name TEXT NOT NULL DEFAULT '', bank_account_number TEXT NOT NULL DEFAULT '', bank_account_holder TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"),
+    qRun(env, "CREATE TABLE IF NOT EXISTS businesses (id INTEGER PRIMARY KEY AUTOINCREMENT, owner_user_id INTEGER, legacy INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL, address TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', website TEXT NOT NULL DEFAULT '', logo TEXT NOT NULL DEFAULT '', bank_name TEXT NOT NULL DEFAULT '', bank_account_number TEXT NOT NULL DEFAULT '', bank_account_holder TEXT NOT NULL DEFAULT '', stamp_enabled INTEGER NOT NULL DEFAULT 1, stamp_color TEXT NOT NULL DEFAULT 'red', stamp_model TEXT NOT NULL DEFAULT '1', stamp_image TEXT NOT NULL DEFAULT '', signer_name TEXT NOT NULL DEFAULT '', signature TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"),
     ...["customers", "jobs", "service_prices"].map((table) =>
       qRun(env, `ALTER TABLE ${table} ADD COLUMN business_id INTEGER NOT NULL DEFAULT 0`).catch(() => {})),
+    qRun(env, "ALTER TABLE businesses ADD COLUMN stamp_enabled INTEGER NOT NULL DEFAULT 1").catch(() => {}),
+    qRun(env, "ALTER TABLE businesses ADD COLUMN stamp_color TEXT NOT NULL DEFAULT 'red'").catch(() => {}),
+    qRun(env, "ALTER TABLE businesses ADD COLUMN stamp_model TEXT NOT NULL DEFAULT '1'").catch(() => {}),
+    qRun(env, "ALTER TABLE businesses ADD COLUMN stamp_image TEXT NOT NULL DEFAULT ''").catch(() => {}),
+    qRun(env, "ALTER TABLE businesses ADD COLUMN signer_name TEXT NOT NULL DEFAULT ''").catch(() => {}),
+    qRun(env, "ALTER TABLE businesses ADD COLUMN signature TEXT NOT NULL DEFAULT ''").catch(() => {}),
     ...[["customers", "idx_customers_business"], ["jobs", "idx_jobs_business"], ["service_prices", "idx_prices_business"]].map(([table, index]) =>
       qRun(env, `CREATE INDEX IF NOT EXISTS ${index} ON ${table}(business_id)`)),
   ]);
@@ -195,20 +201,23 @@ function businessSettings(b) {
     bank_name: b.bank_name || "",
     bank_account_number: b.bank_account_number || "",
     bank_account_holder: b.bank_account_holder || "",
+    stamp_image: b.stamp_image || "",
+    signer_name: b.signer_name || "",
+    signature: b.signature || "",
   };
 }
 
-const BUSINESS_FIELDS = ["business_name", "business_address", "business_phone", "business_website", "business_logo", "bank_name", "bank_account_number", "bank_account_holder"];
-const BUSINESS_COLUMNS = { business_name: "name", business_address: "address", business_phone: "phone", business_website: "website", business_logo: "logo", bank_name: "bank_name", bank_account_number: "bank_account_number", bank_account_holder: "bank_account_holder" };
+const BUSINESS_FIELDS = ["business_name", "business_address", "business_phone", "business_website", "business_logo", "bank_name", "bank_account_number", "bank_account_holder", "stamp_image", "signer_name", "signature"];
+const BUSINESS_COLUMNS = { business_name: "name", business_address: "address", business_phone: "phone", business_website: "website", business_logo: "logo", bank_name: "bank_name", bank_account_number: "bank_account_number", bank_account_holder: "bank_account_holder", stamp_image: "stamp_image", signer_name: "signer_name", signature: "signature" };
 
 function validateBusinessProfile(body) {
   const out = {};
   for (const key of BUSINESS_FIELDS) {
     if (!(key in (body || {}))) continue;
     const value = String(body[key] || "").trim();
-    if (key === "business_logo") {
-      if (value && !/^data:image\/(png|jpeg);base64,/.test(value)) return { error: "Logo harus berupa gambar PNG atau JPEG." };
-      if (value.length > 1500000) return { error: "Logo terlalu besar (maksimal sekitar 1 MB setelah diperkecil)." };
+    if (key === "business_logo" || key === "signature" || key === "stamp_image") {
+      if (value && !/^data:image\/(png|jpeg);base64,/.test(value)) return { error: key === "business_logo" ? "Logo harus berupa gambar PNG atau JPEG." : key === "stamp_image" ? "Gambar stempel harus berupa gambar PNG atau JPEG." : "Tanda tangan harus berupa gambar PNG atau JPEG." };
+      if (value.length > 1500000) return { error: key === "business_logo" ? "Logo terlalu besar (maksimal sekitar 1 MB setelah diperkecil)." : key === "stamp_image" ? "Gambar stempel terlalu besar (maksimal sekitar 1 MB setelah diperkecil)." : "Tanda tangan terlalu besar (maksimal sekitar 1 MB setelah diperkecil)." };
     } else if (value.length > 200) {
       return { error: `Isi ${key} maksimal 200 karakter.` };
     }
@@ -356,6 +365,20 @@ async function ensureJobItemsTable(env) {
   await qRun(env, "CREATE INDEX IF NOT EXISTS idx_job_items_job ON job_items(job_id)");
   ensuredJobItems = true;
 }
+
+// Kolom payment_method (cara bayar) + bank_text (rekening per transaksi)
+// ditambahkan ke jobs yang sudah ada lewat ALTER, bukan migrasi manual.
+// Transaksi lama dianggap transfer (nilai default), karena sebelumnya
+// invoice selalu menampilkan rekening dari Pengaturan.
+let ensuredPaymentMethod = false;
+async function ensurePaymentMethodColumn(env) {
+  if (ensuredPaymentMethod) return;
+  try { await qRun(env, "ALTER TABLE jobs ADD COLUMN payment_method TEXT NOT NULL DEFAULT 'transfer'"); } catch {}
+  try { await qRun(env, "ALTER TABLE jobs ADD COLUMN bank_text TEXT NOT NULL DEFAULT ''"); } catch {}
+  ensuredPaymentMethod = true;
+}
+const PAYMENT_METHODS = ["transfer", "cash"];
+const validPaymentMethod = (v) => PAYMENT_METHODS.includes(v) ? v : "transfer";
 
 // Kolom paid_amount (sudah dibayar) ditambahkan ke jobs yang sudah ada
 // lewat ALTER, bukan migrasi manual. Transaksi lama yang berstatus lunas
@@ -558,13 +581,16 @@ export async function handleApi(request, env) {
       const today = todayId();
       const month = today.slice(0, 7);
       const { from: mFrom, to: mTo } = monthRange(month);
+      const [py, pm] = month.split("-").map(Number);
+      const prevMonth = pm === 1 ? `${py - 1}-12` : `${py}-${String(pm - 1).padStart(2, "0")}`;
+      const { from: pFrom, to: pTo } = monthRange(prevMonth);
       const totalsSql = `SELECT COUNT(*) AS count,
                 COALESCE(SUM(amount), 0) AS total,
                 COALESCE(SUM(CASE WHEN status = 'lunas' THEN amount ELSE 0 END), 0) AS total_lunas,
                 COALESCE(SUM(CASE WHEN status = 'dp' THEN amount ELSE 0 END), 0) AS total_dp,
                 COALESCE(SUM(CASE WHEN status = 'belum' THEN amount ELSE 0 END), 0) AS total_belum
          FROM jobs WHERE business_id = ? AND job_date BETWEEN ? AND ?`;
-      const [customers, jobsRaw, prices, dailyTotals, monthlyTotals] = await Promise.all([
+      const [customers, jobsRaw, prices, dailyTotals, monthlyTotals, lastMonthTotals] = await Promise.all([
         (async () => { await ensureNextVisitColumn(env); return qAll(env, "SELECT * FROM customers WHERE business_id = ? ORDER BY name COLLATE NOCASE ASC LIMIT 500", bid); })(),
         (async () => {
           await ensurePaidAmountColumn(env);
@@ -575,6 +601,7 @@ export async function handleApi(request, env) {
         qAll(env, "SELECT * FROM service_prices WHERE business_id = ? ORDER BY service_type ASC", bid),
         qFirst(env, totalsSql, bid, today, today),
         qFirst(env, totalsSql, bid, mFrom, mTo),
+        qFirst(env, totalsSql, bid, pFrom, pTo),
       ]);
       const jobs = await attachJobItems(env, jobsRaw);
       return json({
@@ -584,7 +611,7 @@ export async function handleApi(request, env) {
         customers,
         jobs,
         prices,
-        totals: { daily: dailyTotals, monthly: monthlyTotals },
+        totals: { daily: dailyTotals, monthly: monthlyTotals, lastMonth: lastMonthTotals },
       });
     }
 
@@ -810,14 +837,17 @@ export async function handleApi(request, env) {
       if (!isValidDate(jobDate)) return json({ error: "Tanggal tidak valid (YYYY-MM-DD)." }, 400);
       if (!STATUSES.includes(status)) return json({ error: "Status tidak valid." }, 400);
       await ensurePaidAmountColumn(env);
+      await ensurePaymentMethodColumn(env);
       const paidV = validatePaidAmount(body?.paid_amount, amount);
       if (paidV.error) return json({ error: paidV.error }, 400);
       const customer = await qFirst(env, "SELECT id FROM customers WHERE id = ? AND business_id = ?", customerId, bid);
       if (!customer) return json({ error: "Pelanggan tidak ditemukan." }, 404);
       const now = new Date().toISOString();
+      const paymentMethod = validPaymentMethod(body?.payment_method);
+      const bankText = String(body?.bank_text || "").trim().slice(0, 200);
       const res = await qRun(env,
-        "INSERT INTO jobs (business_id, customer_id, service_type, amount, paid_amount, status, job_date, note, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        bid, customerId, serviceType, amount, paidV.paid, status, jobDate, (body.note || "").trim(), now, now);
+        "INSERT INTO jobs (business_id, customer_id, service_type, amount, paid_amount, status, job_date, note, payment_method, bank_text, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        bid, customerId, serviceType, amount, paidV.paid, status, jobDate, (body.note || "").trim(), paymentMethod, bankText, now, now);
       await saveJobItems(env, res.meta.last_row_id, items);
       const row = await qFirst(env, "SELECT * FROM jobs WHERE id = ?", res.meta.last_row_id);
       return json({ job: { ...row, items } }, 201);
@@ -847,12 +877,15 @@ export async function handleApi(request, env) {
           return json({ error: "Data transaksi tidak valid." }, 400);
         }
         await ensurePaidAmountColumn(env);
+        await ensurePaymentMethodColumn(env);
         const existing = await qFirst(env, "SELECT * FROM jobs WHERE id = ? AND business_id = ?", id, bid);
         if (!existing) return json({ error: "Transaksi tidak ditemukan." }, 404);
         const paidV = validatePaidAmount(body?.paid_amount !== undefined ? body.paid_amount : existing.paid_amount, amount);
         if (paidV.error) return json({ error: paidV.error }, 400);
-        await qRun(env, "UPDATE jobs SET service_type = ?, amount = ?, paid_amount = ?, status = ?, job_date = ?, note = ?, updated_at = ? WHERE id = ?",
-          serviceType, amount, paidV.paid, status, jobDate, (body.note || "").trim(), new Date().toISOString(), id);
+        const paymentMethod = body?.payment_method !== undefined ? validPaymentMethod(body.payment_method) : (existing.payment_method || "transfer");
+        const bankText = body?.bank_text !== undefined ? String(body.bank_text || "").trim().slice(0, 200) : (existing.bank_text || "");
+        await qRun(env, "UPDATE jobs SET service_type = ?, amount = ?, paid_amount = ?, status = ?, job_date = ?, note = ?, payment_method = ?, bank_text = ?, updated_at = ? WHERE id = ?",
+          serviceType, amount, paidV.paid, status, jobDate, (body.note || "").trim(), paymentMethod, bankText, new Date().toISOString(), id);
         const row = await qFirst(env, "SELECT * FROM jobs WHERE id = ?", id);
         await saveJobItems(env, id, items);
         return json({ job: { ...row, items } });
@@ -991,7 +1024,7 @@ export async function handleApi(request, env) {
       // ulang, supaya restore tidak bentrok dengan id usaha lain.
       await qRun(env, "CREATE TABLE IF NOT EXISTS customers (id INTEGER PRIMARY KEY AUTOINCREMENT, business_id INTEGER NOT NULL DEFAULT 0, name TEXT NOT NULL, address TEXT NOT NULL DEFAULT '', phone TEXT NOT NULL DEFAULT '', next_visit_date TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
       await ensureNextVisitColumn(env);
-      await qRun(env, "CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, business_id INTEGER NOT NULL DEFAULT 0, customer_id INTEGER NOT NULL REFERENCES customers(id), service_type TEXT NOT NULL, amount INTEGER NOT NULL DEFAULT 0, paid_amount INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'lunas', job_date TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
+      await qRun(env, "CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, business_id INTEGER NOT NULL DEFAULT 0, customer_id INTEGER NOT NULL REFERENCES customers(id), service_type TEXT NOT NULL, amount INTEGER NOT NULL DEFAULT 0, paid_amount INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'lunas', job_date TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', payment_method TEXT NOT NULL DEFAULT 'transfer', bank_text TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)");
       await ensureServicePricesTable(env);
       await ensureJobItemsTable(env);
       await qRun(env, "DELETE FROM job_items WHERE job_id IN (SELECT id FROM jobs WHERE business_id = ?)", bid);

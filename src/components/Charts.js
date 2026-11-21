@@ -5,7 +5,7 @@ export function fmtRp(n) {
 const STATUS_META = {
   lunas: { label: "Lunas", color: "#22c55e" },
   dp: { label: "DP", color: "#f59e0b" },
-  belum: { label: "Belum bayar", color: "#e60012" },
+  belum: { label: "Belum bayar", color: "#EA580C" },
 };
 
 export function BarChart({ labels, values, onSelect }) {
@@ -23,8 +23,8 @@ export function BarChart({ labels, values, onSelect }) {
           <g key={i} onClick={onSelect ? () => onSelect(labels[i], v) : undefined}
             style={onSelect ? { cursor: "pointer" } : undefined}>
             <title>{`${labels[i]}: ${fmtRp(v)}`}</title>
-            <rect x={x} y={y} width={bw} height={bh} fill="#e60012" />
-            {bw >= 28 && <text x={x + bw / 2} y={y - 6} textAnchor="middle" fontSize="11" fontWeight="700" fill="#e60012">{fmtRp(v)}</text>}
+            <rect x={x} y={y} width={bw} height={bh} fill="var(--accent)" />
+            {bw >= 28 && <text x={x + bw / 2} y={y - 6} textAnchor="middle" fontSize="11" fontWeight="700" className="chart-label">{fmtRp(v)}</text>}
             <text x={x + bw / 2} y={H - 8} textAnchor="middle" fontSize="11" fill="#667085">{labels[i].slice(5)}</text>
           </g>
         );
@@ -42,7 +42,7 @@ export function DonutChart({ parts, onSelect }) {
     <div className="flex flex-col items-center gap-4">
       <div className="relative w-48 h-48">
         <svg viewBox="0 0 200 200" className="w-full h-full -rotate-90" role="img" aria-label="Grafik donat status pembayaran">
-          <circle cx="100" cy="100" r={R} fill="none" stroke="#2a2a2a" strokeWidth="26" />
+          <circle cx="100" cy="100" r={R} fill="none" stroke="currentColor" strokeWidth="26" className="donut-track" />
           {parts.map((p) => {
             const len = (p.value / total) * C;
             const el = (
@@ -85,7 +85,7 @@ export function HBarChart({ rows }) {
         <div key={r.service_type} className="grid grid-cols-[140px_1fr_auto] gap-3 items-center text-sm max-sm:grid-cols-[1fr_auto] max-sm:[&>*:first-child]:col-span-2">
           <span className="truncate font-medium">{r.service_type}</span>
           <div className="h-5 bg-zinc-800 rounded-sm overflow-hidden">
-            <div className="h-full bg-persona" style={{ width: `${(Number(r.total) / max) * 100}%` }} />
+            <div className="h-full bg-accent" style={{ width: `${(Number(r.total) / max) * 100}%` }} />
           </div>
           <span className="text-zinc-300 whitespace-nowrap">{fmtRp(r.total)}</span>
         </div>
@@ -97,15 +97,15 @@ export function HBarChart({ rows }) {
 export function statusPill(status) {
   const meta = STATUS_META[status] || { label: status, color: "#a1a1aa" };
   const cls = status === "lunas" ? "bg-emerald-500/15 text-emerald-400"
-    : status === "dp" ? "bg-amber-500/15 text-amber-400" : "bg-red-500/15 text-red-400";
-  return <span className={`inline-block px-3 py-0.5 rounded-full text-xs font-bold ${cls}`}>{meta.label}</span>;
+    : status === "dp" ? "bg-amber-500/15 text-amber-400" : "bg-orange-500/15 text-orange-400";
+  return <span className={`inline-block self-start shrink-0 px-3 py-0.5 rounded-full text-xs font-bold ${cls}`}>{meta.label}</span>;
 }
 
 export function statusParts(totals) {
   return [
     { label: "Lunas", value: Number(totals.total_lunas || 0), color: "#22c55e" },
     { label: "DP", value: Number(totals.total_dp || 0), color: "#f59e0b" },
-    { label: "Belum bayar", value: Number(totals.total_belum || 0), color: "#e60012" },
+    { label: "Belum bayar", value: Number(totals.total_belum || 0), color: "#EA580C" },
   ];
 }
 

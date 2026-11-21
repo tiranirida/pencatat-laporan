@@ -16,11 +16,21 @@ Webapp pribadi untuk mencatat pelanggan jasa dan laporan pemasukan harian sampai
 - Invoice PDF: buka detail transaksi di tab Transaksi, lalu unduh invoice PDF (header memakai informasi usaha dari Pengaturan)
 - Multi-layanan per transaksi: satu transaksi bisa berisi beberapa baris layanan (cth: Sedot WC + Perbaikan Wastafel + Lain-lain) dalam satu invoice; tiap baris punya jumlah, satuan (kubik/strip/pcs/paket/tanki/titik), harga satuan, dan subtotal — total transaksi adalah jumlah subtotalnya. Laporan per jenis jasa juga dihitung per baris layanan, bukan per transaksi.
 - Pengaturan: tema gelap/terang dan informasi usaha (nama, alamat, telepon, website) yang dipakai di invoice
+- Skema warna: pilih Biru, Merah, Hijau, Oren, Putih, atau Full Hitam di Pengaturan — satu garis shade yang sama untuk semua skema, tetap kalem
 - Logo perusahaan: upload di Pengaturan (otomatis diperkecil maks. 512px, disimpan di D1), tampil di kop invoice di kiri nama usaha
 - Logo aplikasi: logo dokumen+grafik+pena hitam-merah, versi dark (latar hitam) dan light (latar putih) di header dan login; tombol profil di pojok memakai logo perusahaan bila sudah diupload, bila belum memakai ikon profil
 - Kirim invoice ke WhatsApp: dari detail transaksi, tombol Kirim via WhatsApp membagikan file PDF langsung lewat lembar berbagi perangkat (Web Share API, Chrome Android — pilih WhatsApp lalu pilih kontak pelanggan). Bila browser tidak mendukung berbagi file, fallback-nya membuka chat wa.me ke nomor WA pelanggan dengan pesan teks invoice (wa.me tidak bisa melampirkan file)
 - PWA: manifest + service worker (shell bisa dibuka offline, API tidak pernah di-cache), menu Install aplikasi ada di Profil & Pengaturan saat browser menawarkan instalasi
 - Ekspor laporan ke CSV
+
+## Tampilan Aplikasi
+
+Tampilan aplikasi di HP (mode terang), November 2026:
+
+| | | |
+|---|---|---|
+| ![Dashboard](docs/screenshots/dashboard.jpg)<br>**Dashboard** — pemasukan bulan ini, piutang, tren | ![Pelanggan](docs/screenshots/pelanggan.jpg)<br>**Pelanggan** — daftar & cari pelanggan | ![Transaksi](docs/screenshots/transaksi.jpg)<br>**Transaksi** — filter periode & status |
+| ![Laporan](docs/screenshots/laporan.jpg)<br>**Laporan** — filter periode, total per status | ![Detail transaksi](docs/screenshots/detail-transaksi.jpg)<br>**Detail transaksi** — kirim WA, preview invoice | ![Preview Invoice](docs/screenshots/preview-invoice.jpg)<br>**Preview Invoice** — invoice siap kirim |
 
 ## Login: password lama + Google OAuth (multi-tenant)
 

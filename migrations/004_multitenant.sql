@@ -24,6 +24,12 @@ CREATE TABLE IF NOT EXISTS businesses (
   bank_name TEXT NOT NULL DEFAULT '',
   bank_account_number TEXT NOT NULL DEFAULT '',
   bank_account_holder TEXT NOT NULL DEFAULT '',
+  stamp_enabled INTEGER NOT NULL DEFAULT 1,
+  stamp_color TEXT NOT NULL DEFAULT 'red',
+  stamp_model TEXT NOT NULL DEFAULT '1',
+  stamp_image TEXT NOT NULL DEFAULT '',
+  signer_name TEXT NOT NULL DEFAULT '',
+  signature TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
